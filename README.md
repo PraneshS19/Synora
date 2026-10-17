@@ -12,7 +12,7 @@ SYNORA is a React and TypeScript frontend prototype for five institutional docum
 Clone the repository and install the locked dependencies:
 
 ```bash
-git clone https://github.com/<your-github-username>/Synora.git
+git clone https://github.com/PraneshS19/Synora.git
 cd Synora
 npm ci
 ```
