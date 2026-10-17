@@ -1,0 +1,8 @@
+/* Source SVG paths recovered from the standalone SYNORA prototype. */
+.paths{position:absolute;inset:0;z-index:0;opacity:.56;mask-image:linear-gradient(to bottom,transparent 0%,#000 16%,#000 78%,transparent 100%)}
+.paths svg{width:100%;height:100%;overflow:visible}
+.paths path{fill:none;stroke:rgba(247,247,247,.38);stroke-width:.65;stroke-dasharray:1 8;stroke-linecap:round;animation:path-flow 20s linear infinite}
+.paths path:nth-child(3n){stroke:rgba(247,247,247,.22);animation-duration:27s;animation-direction:reverse}
+.paths path:nth-child(4n){stroke-width:1;stroke:rgba(247,247,247,.16);animation-duration:24s}
+@keyframes path-flow{to{stroke-dashoffset:-220}}
+@media(prefers-reduced-motion:reduce){.paths path{animation:none}}

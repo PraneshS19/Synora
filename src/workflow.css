@@ -1,0 +1,14 @@
+/* Measured, container-relative connector layer shared by every workflow. */
+.orbit-scene,.compare-diagram{isolation:isolate;position:relative}
+.orbit-connections,.comparison-connections{position:absolute!important;inset:0;z-index:1!important;display:block!important;width:100%!important;height:100%!important;overflow:hidden;visibility:visible!important;opacity:1!important;pointer-events:none}
+.orbit-scene .orbit-connections path,.compare-diagram .comparison-connections path{display:block!important;visibility:visible!important;fill:none;stroke:rgba(235,235,240,.44)!important;stroke-width:1.45!important;opacity:1!important;vector-effect:non-scaling-stroke}
+.orbit-connections circle,.comparison-connections circle{display:block;visibility:visible}.orbit-node,.compare-node{z-index:2}
+/* Graph nodes are complete from the first paint; only connectors carry motion. */
+.orbit-node,.compare-node.version-a,.compare-node.version-b,.compare-node.compare-hub,.compare-node.compare-result{animation:none!important;opacity:1!important}
+.version-a:hover{transform:rotate(-4deg) translateY(-4px)}
+.version-b:hover{transform:rotate(4deg) translateY(-4px)}
+.compare-hub:hover{transform:translateX(-50%) translateY(-4px)}
+.compare-result:hover{transform:translateY(-4px)}
+
+@media (max-width:600px){.orbit-connections,.comparison-connections{display:none}.version-a{left:7%;top:35px}.version-b{left:auto;right:7%;top:58px}.compare-hub{top:245px}.compare-result{left:50%;right:auto;top:355px;transform:translateX(-50%)}.compare-result:hover{transform:translateX(-50%) translateY(-4px)}}
+@media (prefers-reduced-motion:reduce){.orbit-connections animateMotion,.comparison-connections animateMotion{display:none}}

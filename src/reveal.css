@@ -1,0 +1,8 @@
+.reveal{opacity:1;transform:none}
+.reveal[data-reveal-ready="true"]:not(.visible){opacity:0;transform:translateY(24px)}
+.reveal.visible{opacity:1;transform:none;transition:opacity .8s var(--ease),transform .8s var(--ease)}
+.capability-reveal{transition-delay:0ms}.capability-reveal.delay-1{transition-delay:70ms}.capability-reveal.delay-2{transition-delay:140ms}.capability-reveal.delay-3{transition-delay:210ms}.capability-reveal.delay-4{transition-delay:280ms}
+.feature-scene{transition-delay:110ms}
+.feature-section.flip .feature-scene{order:1}
+@media(max-width:820px){.feature-section.flip .feature-scene{order:initial}}
+@media(prefers-reduced-motion:reduce){.reveal,.reveal[data-reveal-ready="true"]:not(.visible){opacity:1;transform:none;transition:none}}
