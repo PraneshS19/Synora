@@ -1,6 +1,36 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Python virtual environments and generated files
+.venv/
+**/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local backend content (uploads and SQLite state can contain private data)
+backend/data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local model weights and Hugging Face caches
+.cache/
+**/.cache/
+models/
+backend/models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# Local secrets (keep the safe template tracked)
 .env
 .env.*
 !.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example

@@ -1,6 +1,24 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
 import { moduleById, modules, type ModuleDefinition, type ModuleId } from './modules'
 import { href, useRoute, type Route } from './routing'
+import {
+  uploadFiles,
+  createCollection,
+  askQuestion,
+  createTranslationJob,
+  getTranslationJob,
+  updateTranslationSegment,
+  createMeetingJob,
+  getMeetingJob,
+  getLatestMeetingJob,
+  updateMeetingDraft,
+  type Collection,
+  type QuestionResponse,
+  type TranslationJob,
+  type MeetingJob,
+  type MeetingDraft,
+} from './api'
+
 
 const lines = (text: string) => text.split('\n').map((line, index) => <span key={index}>{line}</span>)
 const revealedLandingItems = new Set<string>()
@@ -158,12 +176,846 @@ function FileQueue({ title, accept, files, onChange, multiple = true, maxMb = 20
   return <section className={`file-queue ${dragging ? 'is-dragging' : ''}`}><input ref={input} className="visually-hidden" type="file" accept={accept.join(',')} multiple={multiple} onChange={(event) => add(event.target.files)} /><div className="queue-dropzone" role="button" tabIndex={0} onClick={() => input.current?.click()} onKeyDown={(event) => event.key === 'Enter' && input.current?.click()} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); add(event.dataTransfer.files) }}><b>{title}</b><span>{hint}</span><span className="queue-action">Choose files or drag them here</span></div>{error && <p className="upload-error" role="alert">{error}</p>}{files.length ? <ul className="file-list" aria-label={`${title} selected files`}>{files.map(({ id, file }) => <li key={id}><span><b>{file.name}</b><small>{file.type || file.name.split('.').pop()?.toUpperCase()} · {formatBytes(file.size)} · Selected locally</small></span><button className="icon-button" type="button" aria-label={`Remove ${file.name}`} onClick={() => onChange(files.filter((item) => item.id !== id))}>×</button></li>)}</ul> : <p className="queue-empty">No files selected.</p>}</section>
 }
 
+function RagWorkspace() {
+  const documentTypes = ['.pdf', '.docx', '.txt']
+  const [ragFiles, setRagFiles] = useState<LocalFile[]>([])
+  const [collectionName, setCollectionName] = useState('Institutional Policy Collection')
+  const [question, setQuestion] = useState('')
+  const [collection, setCollection] = useState<Collection | null>(null)
+  const [result, setResult] = useState<QuestionResponse | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleAsk = async () => {
+    if (!ragFiles.length) {
+      setError('Please add at least one document to the collection.')
+      return
+    }
+    if (!question.trim()) {
+      setError('Please enter a question to ask the collection.')
+      return
+    }
+
+    setError(null)
+    setIsLoading(true)
+
+    try {
+      let currentCollection = collection
+      if (!currentCollection) {
+        setStatusMessage('Uploading documents to secure local storage...')
+        const uploaded = await uploadFiles(ragFiles.map((f) => f.file), 'rag')
+
+        setStatusMessage('Extracting text and indexing vector embeddings...')
+        const fileIds = uploaded.map((u) => u.id)
+        currentCollection = await createCollection(collectionName || 'Default Collection', fileIds)
+        setCollection(currentCollection)
+      }
+
+      setStatusMessage('Retrieving evidence and formulating answer...')
+      const response = await askQuestion(currentCollection.id, question)
+      setResult(response)
+      setStatusMessage(null)
+    } catch (err: any) {
+      setError(err.message || 'An unexpected error occurred during RAG processing.')
+      setStatusMessage(null)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  return (
+    <div className="workspace-flow">
+      <label className="field">
+        Collection name
+        <input
+          value={collectionName}
+          onChange={(e) => setCollectionName(e.target.value)}
+          placeholder="e.g. Admissions policies"
+        />
+      </label>
+      <FileQueue
+        title="Add documents to start a collection"
+        accept={documentTypes}
+        files={ragFiles}
+        onChange={(files) => {
+          setRagFiles(files)
+          setCollection(null)
+          setResult(null)
+        }}
+        hint="PDF, DOCX, or TXT · up to 20 MB each"
+      />
+      <p className="integration-state">
+        {collection
+          ? `Indexed collection '${collection.name}' (${collection.chunkCount} passages, provider: ${collection.embeddingProvider || 'local'}${collection.embeddingDim ? `, ${collection.embeddingDim}-dim` : ''}).`
+          : ragFiles.length
+          ? `${ragFiles.length} document(s) queued. Clicking 'Ask collection' will upload and index them in the private vector store.`
+          : 'Select documents before a collection can be indexed.'}
+      </p>
+      <label className="field">
+        Question
+        <textarea
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          placeholder="Ask a question grounded in your collection…"
+        />
+      </label>
+      {error && (
+        <div className="status-banner error" role="alert">
+          {error}
+          {error.includes('mismatch') && (
+            <div style={{ marginTop: '8px' }}>
+              <button
+                type="button"
+                className="button secondary"
+                style={{ fontSize: '12px', padding: '4px 10px' }}
+                onClick={() => {
+                  setCollection(null)
+                  setError(null)
+                  handleAsk()
+                }}
+              >
+                Re-index collection with active provider
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+      {statusMessage && (
+        <div className="status-indicator">
+          <div className="spinner" />
+          <span>{statusMessage}</span>
+        </div>
+      )}
+      <button
+        className="button primary"
+        disabled={!ragFiles.length || !question.trim() || isLoading}
+        onClick={handleAsk}
+      >
+        {isLoading ? 'Processing…' : 'Ask collection'}
+      </button>
+
+      <section className="evidence-panel">
+        <b>Grounded answer & evidence</b>
+        {!result && !isLoading && (
+          <p>No answer is available until the selected documents have been securely indexed and retrieved.</p>
+        )}
+        {result && (
+          <div>
+            <div className="answer-box">
+              {result.answer}
+            </div>
+            {result.evidenceFound && result.citations.length > 0 && (
+              <div style={{ marginTop: '16px' }}>
+                <b style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--sub)' }}>
+                  Inspectable Evidence ({result.citations.length} citation{result.citations.length > 1 ? 's' : ''})
+                </b>
+                <ul className="citations-list">
+                  {result.citations.map((c, i) => (
+                    <li key={i} className="citation-card">
+                      <div className="citation-header">
+                        <span style={{ fontWeight: 600 }}>{c.name}</span>
+                        <span className="citation-badge">
+                          {c.page ? `Page ${c.page}` : c.section || 'General'}
+                        </span>
+                      </div>
+                      <div className="citation-excerpt">"{c.excerpt}"</div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {!result.evidenceFound && (
+              <div className="status-banner warning" style={{ marginTop: '14px' }}>
+                No citations available. The system identified insufficient evidence in the collection and declined to fabricate an answer.
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function TranslateWorkspace() {
+  const documentTypes = ['.pdf', '.docx', '.txt']
+  const [translateFiles, setTranslateFiles] = useState<LocalFile[]>([])
+  const [sourceLang, setSourceLang] = useState('English')
+  const [targetLang, setTargetLang] = useState('Tamil')
+  const [sourceText, setSourceText] = useState('')
+  const [job, setJob] = useState<TranslationJob | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleTranslate = async () => {
+    if (!translateFiles.length && !sourceText.trim()) {
+      setError('Please provide a document or paste source text to translate.')
+      return
+    }
+
+    if (sourceLang.toLowerCase() === targetLang.toLowerCase()) {
+      setError('Source and target languages cannot be identical. Please select distinct languages.')
+      return
+    }
+
+    setError(null)
+    setIsLoading(true)
+    setStatusMessage('Uploading and extracting source content...')
+
+    try {
+      let fileIds: string[] = []
+      if (translateFiles.length) {
+        const uploaded = await uploadFiles(translateFiles.map((f) => f.file), 'translate')
+        fileIds = uploaded.map((u) => u.id)
+      }
+
+      setStatusMessage(`Submitting translation task...`)
+      const res = await createTranslationJob({
+        fileIds,
+        sourceText: sourceText.trim() || undefined,
+        sourceLanguage: sourceLang,
+        targetLanguage: targetLang,
+      })
+
+      setStatusMessage(`Fetching translation draft...`)
+      // Fetch and poll GET /api/translate/jobs/{job_id}
+      let currentJob = await getTranslationJob(res.id)
+      let attempts = 0
+      while ((currentJob.status === 'queued' || currentJob.status === 'processing') && attempts < 30) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        currentJob = await getTranslationJob(res.id)
+        attempts++
+      }
+
+      if (currentJob.status === 'failed') {
+        setError(currentJob.error || 'Translation job failed.')
+        setJob(null)
+      } else {
+        setJob(currentJob)
+      }
+      setStatusMessage(null)
+    } catch (err: any) {
+      setError(err.message || 'An error occurred during translation.')
+      setStatusMessage(null)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleSegmentEdit = async (
+    segmentId: string,
+    newText: string,
+    reviewFlag: 'unreviewed' | 'approved' | 'edited' | 'no_model'
+  ) => {
+    if (!job) return
+    try {
+      const updated = await updateTranslationSegment(job.id, segmentId, newText, reviewFlag)
+      setJob(updated)
+    } catch (err: any) {
+      setError(`Failed to save edit: ${err.message}`)
+    }
+  }
+
+  return (
+    <div className="workspace-flow">
+      <FileQueue
+        title="Upload institutional document"
+        accept={documentTypes}
+        files={translateFiles}
+        onChange={(files) => {
+          setTranslateFiles(files)
+          setJob(null)
+        }}
+        hint="PDF, DOCX, or TXT · up to 20 MB each"
+      />
+      <div className="two-up">
+        <label className="field">
+          Source language
+          <select value={sourceLang} onChange={(e) => setSourceLang(e.target.value)}>
+            <option>English</option>
+            <option>Tamil</option>
+            <option>Hindi</option>
+            <option>Telugu</option>
+            <option>Kannada</option>
+            <option>Malayalam</option>
+          </select>
+        </label>
+        <label className="field">
+          Target language
+          <select value={targetLang} onChange={(e) => setTargetLang(e.target.value)}>
+            <option>Tamil</option>
+            <option>Hindi</option>
+            <option>Telugu</option>
+            <option>Kannada</option>
+            <option>Malayalam</option>
+            <option>Bengali</option>
+            <option>Marathi</option>
+          </select>
+        </label>
+      </div>
+      <label className="field">
+        Optional source text
+        <textarea
+          value={sourceText}
+          onChange={(e) => setSourceText(e.target.value)}
+          placeholder="Paste a short passage only when a document is not available…"
+        />
+      </label>
+      <p className="integration-state">
+        {job
+          ? `Translation job completed (${job.segments.length} segment${job.segments.length > 1 ? 's' : ''}). All segments are editable drafts.`
+          : 'Document extraction and translation are ready. The original file remains unchanged.'}
+      </p>
+      {error && <div className="status-banner error" role="alert">{error}</div>}
+      {statusMessage && (
+        <div className="status-indicator">
+          <div className="spinner" />
+          <span>{statusMessage}</span>
+        </div>
+      )}
+      <button
+        className="button primary"
+        disabled={(!translateFiles.length && !sourceText.trim()) || isLoading}
+        onClick={handleTranslate}
+      >
+        {isLoading ? 'Translating…' : 'Extract and translate'}
+      </button>
+
+      <section className="translation-review">
+        <b>Translation review & editing</b>
+        {!job && !isLoading && (
+          <p>Original and translated content will appear here side by side after real extraction and translation are available.</p>
+        )}
+        {job && (
+          <div>
+            <div className="status-banner warning" style={{ margin: '12px 0' }}>
+              {job.limitations?.[0] || 'Machine translation draft. Human review required before institutional publication.'}
+            </div>
+            <div className="segment-list">
+              {job.segments.map((seg) => {
+                const isNoModel = seg.reviewFlag === 'no_model' || !seg.translated?.trim()
+                const tagLabel = isNoModel
+                  ? 'No translation model configured'
+                  : seg.reviewFlag === 'approved'
+                  ? '✓ Approved'
+                  : seg.reviewFlag === 'edited'
+                  ? '✎ Edited'
+                  : 'Review required'
+
+                return (
+                  <div key={seg.id} className="segment-card">
+                    <div className="segment-source">
+                      <small style={{ display: 'block', marginBottom: '4px', color: 'var(--muted)' }}>Source ({job.sourceLanguage})</small>
+                      {seg.source}
+                    </div>
+                    <div className="segment-target">
+                      <div className="segment-actions">
+                        <small style={{ color: 'var(--muted)' }}>Draft ({job.targetLanguage})</small>
+                        <button
+                          type="button"
+                          className={`review-tag ${isNoModel ? 'no-model' : seg.reviewFlag}`}
+                          title={isNoModel ? 'Translation model is not configured. Type draft manually.' : 'Click to toggle status'}
+                          onClick={() => {
+                            if (isNoModel) return
+                            const nextFlag = seg.reviewFlag === 'approved' ? 'unreviewed' : 'approved'
+                            handleSegmentEdit(seg.id, seg.translated, nextFlag)
+                          }}
+                        >
+                          {tagLabel}
+                        </button>
+                      </div>
+                      <textarea
+                        className="segment-textarea"
+                        value={seg.translated}
+                        placeholder={
+                          isNoModel
+                            ? 'No translation model is configured. Enter translation draft manually…'
+                            : 'Enter or refine translation draft…'
+                        }
+                        onChange={(e) => {
+                          const val = e.target.value
+                          setJob({
+                            ...job,
+                            segments: job.segments.map((s) => s.id === seg.id ? { ...s, translated: val, reviewFlag: 'edited' } : s)
+                          })
+                        }}
+                        onBlur={(e) => handleSegmentEdit(seg.id, e.target.value, 'edited')}
+                      />
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function MeetingWorkspace() {
+  const [audioFiles, setAudioFiles] = useState<LocalFile[]>([])
+  const [transcriptFiles, setTranscriptFiles] = useState<LocalFile[]>([])
+  const [meetingTitle, setMeetingTitle] = useState('Institutional Meeting')
+  const [job, setJob] = useState<MeetingJob | null>(null)
+  const [draft, setDraft] = useState<MeetingDraft | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [isSaving, setIsSaving] = useState(false)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [saveMessage, setSaveMessage] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  // Restore latest draft or active job on component mount / browser refresh
+  useEffect(() => {
+    let isMounted = true
+    const restoreActiveJob = async () => {
+      const activeJobId = localStorage.getItem('synora_active_meeting_job_id')
+      let loadedJob: MeetingJob | null = null
+
+      if (activeJobId) {
+        try {
+          loadedJob = await getMeetingJob(activeJobId)
+        } catch {
+          // If active ID is missing or invalid, fall back to latest
+        }
+      }
+
+      if (!loadedJob) {
+        try {
+          loadedJob = await getLatestMeetingJob()
+        } catch {
+          // No latest job
+        }
+      }
+
+      if (isMounted && loadedJob && loadedJob.draft) {
+        setJob(loadedJob)
+        setDraft(loadedJob.draft)
+        setMeetingTitle(loadedJob.draft.title || 'Institutional Meeting')
+      }
+    }
+
+    restoreActiveJob()
+    return () => { isMounted = false }
+  }, [])
+
+  const handleGenerate = async () => {
+    if (!audioFiles.length && !transcriptFiles.length) {
+      setError('Please upload at least one audio recording or transcript file.')
+      return
+    }
+
+    setError(null)
+    setSaveMessage(null)
+    setSaveError(null)
+    setIsLoading(true)
+    setStatusMessage('Uploading meeting source files...')
+
+    try {
+      let audioFileIds: string[] = []
+      let transcriptFileIds: string[] = []
+
+      if (audioFiles.length) {
+        const audioUp = await uploadFiles(audioFiles.map((f) => f.file), 'meeting')
+        audioFileIds = audioUp.map((u) => u.id)
+      }
+      if (transcriptFiles.length) {
+        const transUp = await uploadFiles(transcriptFiles.map((f) => f.file), 'meeting')
+        transcriptFileIds = transUp.map((u) => u.id)
+      }
+
+      setStatusMessage('Extracting proceedings, reconciling evidence, and drafting minutes...')
+      const res = await createMeetingJob({
+        audioFileIds,
+        transcriptFileIds,
+        meetingTitle: meetingTitle || undefined,
+      })
+
+      if (res.status === 'failed') {
+        setError(res.error || 'Meeting minutes generation failed.')
+        setJob(null)
+        setDraft(null)
+      } else {
+        setJob(res)
+        setDraft(res.draft || null)
+        if (res.draft?.title) {
+          setMeetingTitle(res.draft.title)
+        }
+        localStorage.setItem('synora_active_meeting_job_id', res.id)
+      }
+      setStatusMessage(null)
+    } catch (err: any) {
+      setError(err.message || 'An error occurred during meeting minutes generation.')
+      setStatusMessage(null)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleSaveDraft = async () => {
+    if (!job || !draft) return
+    setError(null)
+    setSaveError(null)
+    setSaveMessage(null)
+    setIsSaving(true)
+
+    try {
+      // Ensure title in draft is synchronized with the latest input value
+      const currentTitle = draft.title?.trim() || meetingTitle.trim() || 'Institutional Meeting'
+      const draftToSave: MeetingDraft = {
+        ...draft,
+        title: currentTitle,
+      }
+
+      const updatedJob = await updateMeetingDraft(job.id, draftToSave)
+      setJob(updatedJob)
+      if (updatedJob.draft) {
+        setDraft(updatedJob.draft)
+        setMeetingTitle(updatedJob.draft.title)
+      }
+      localStorage.setItem('synora_active_meeting_job_id', job.id)
+      setSaveMessage(`Draft edits successfully saved (Title: "${currentTitle}").`)
+      setTimeout(() => setSaveMessage(null), 5000)
+    } catch (err: any) {
+      setSaveError(`Failed to save draft edits: ${err.message}`)
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  return (
+    <div className="workspace-flow meeting-flow">
+      <label className="field">
+        Meeting Title
+        <input
+          value={draft ? draft.title : meetingTitle}
+          onChange={(e) => {
+            const val = e.target.value
+            setMeetingTitle(val)
+            if (draft) {
+              setDraft({ ...draft, title: val })
+            }
+          }}
+          placeholder="e.g. Academic Council Annual Meeting"
+        />
+      </label>
+
+      <FileQueue
+        title="Upload audio recording"
+        accept={['.mp3', '.wav', '.m4a']}
+        files={audioFiles}
+        onChange={(files) => {
+          setAudioFiles(files)
+          setJob(null)
+        }}
+        hint="MP3, WAV, or M4A · up to 200 MB each"
+        maxMb={200}
+      />
+      <FileQueue
+        title="Upload transcript"
+        accept={['.txt', '.docx', '.pdf', '.vtt', '.srt']}
+        files={transcriptFiles}
+        onChange={(files) => {
+          setTranscriptFiles(files)
+          setJob(null)
+        }}
+        hint="TXT, DOCX, PDF, VTT, or SRT · up to 20 MB each"
+      />
+      <p className="integration-state">
+        {draft
+          ? 'Meeting minutes generated. Review decisions and verify flagged action item owners and deadlines.'
+          : 'Use audio, a transcript, or both. Transcription and reconciliation require a configured secure service; no draft minutes will be fabricated.'}
+      </p>
+      {error && <div className="status-banner error" role="alert">{error}</div>}
+      {statusMessage && (
+        <div className="status-indicator">
+          <div className="spinner" />
+          <span>{statusMessage}</span>
+        </div>
+      )}
+      <button
+        className="button primary"
+        disabled={(!audioFiles.length && !transcriptFiles.length) || isLoading}
+        onClick={handleGenerate}
+      >
+        {isLoading ? 'Generating…' : 'Generate draft minutes'}
+      </button>
+
+      <section className="minutes-draft">
+        <b>Reviewable minutes draft</b>
+        {!draft && !isLoading && (
+          <p>A generated draft will remain editable and will identify uncertain decisions, owners, and deadlines for review.</p>
+        )}
+        {draft && (
+          <div className="draft-container">
+            <div className="status-banner warning">
+              {job?.limitations?.[0] || 'Generated draft requires human review. Action owners and deadlines are included only when explicitly stated in source.'}
+            </div>
+
+            <div className="draft-card">
+              <h3>Draft Title & Summary</h3>
+              <input
+                className="field"
+                style={{ marginBottom: '12px', fontWeight: 600 }}
+                value={draft.title}
+                onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+              />
+              <textarea
+                className="field"
+                style={{ minHeight: '90px' }}
+                value={draft.summary}
+                onChange={(e) => setDraft({ ...draft, summary: e.target.value })}
+              />
+            </div>
+
+            <div className="draft-card">
+              <h3>Discussion Topics ({draft.discussions.length})</h3>
+              {draft.discussions.length === 0 ? (
+                <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
+                  No explicit discussion topics identified in the transcript.
+                </p>
+              ) : (
+                draft.discussions.map((d, i) => (
+                  <div key={i} className="draft-item" style={{ marginBottom: '10px' }}>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                      <input
+                        className="field"
+                        style={{ fontWeight: 600, fontSize: '13px', marginBottom: 0, padding: '4px 8px', flex: 1 }}
+                        value={d.topic}
+                        onChange={(e) => {
+                          const next = [...draft.discussions]
+                          next[i] = { ...d, topic: e.target.value }
+                          setDraft({ ...draft, discussions: next })
+                        }}
+                      />
+                      {d.timestamp && <span className="citation-badge">{d.timestamp}</span>}
+                    </div>
+                    <div style={{ display: 'grid', gap: '4px', paddingLeft: '12px' }}>
+                      {d.points.map((pt, j) => (
+                        <textarea
+                          key={j}
+                          className="field"
+                          style={{ minHeight: '36px', fontSize: '12px', margin: 0, padding: '4px 8px', color: 'var(--sub)' }}
+                          value={pt}
+                          onChange={(e) => {
+                            const next = [...draft.discussions]
+                            const nextPts = [...d.points]
+                            nextPts[j] = e.target.value
+                            next[i] = { ...d, points: nextPts }
+                            setDraft({ ...draft, discussions: next })
+                          }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="draft-card">
+              <h3>Formal Decisions ({draft.decisions.length})</h3>
+              {draft.decisions.length === 0 ? (
+                <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
+                  No formal resolutions or voting outcomes were explicitly finalized in the recorded segment.
+                </p>
+              ) : (
+                draft.decisions.map((dec, i) => (
+                  <div key={i} className="draft-item" style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center' }}>
+                    <input
+                      className="field"
+                      style={{ fontSize: '13px', padding: '6px 8px', marginBottom: 0 }}
+                      value={dec.decision}
+                      onChange={(e) => {
+                        const next = [...draft.decisions]
+                        next[i] = { ...dec, decision: e.target.value }
+                        setDraft({ ...draft, decisions: next })
+                      }}
+                    />
+                    <select
+                      style={{ fontSize: '12px', padding: '6px 8px', borderRadius: '4px', border: '1px solid var(--border)', background: 'var(--bg)' }}
+                      value={dec.status}
+                      onChange={(e) => {
+                        const next = [...draft.decisions]
+                        next[i] = { ...dec, status: e.target.value as 'agreed' | 'pending' }
+                        setDraft({ ...draft, decisions: next })
+                      }}
+                    >
+                      <option value="agreed">agreed</option>
+                      <option value="pending">pending</option>
+                    </select>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="draft-card">
+              <h3>Action Items ({draft.actionItems.length})</h3>
+              {draft.actionItems.length === 0 ? (
+                <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
+                  No explicit action assignments or task commitments were identified in the source.
+                </p>
+              ) : (
+                draft.actionItems.map((act, i) => (
+                  <div key={i} className="draft-item" style={{ display: 'grid', gap: '8px' }}>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                      <input
+                        className="field"
+                        style={{ flex: 1, fontSize: '13px', padding: '6px 8px', marginBottom: 0 }}
+                        value={act.task}
+                        onChange={(e) => {
+                          const next = [...draft.actionItems]
+                          next[i] = { ...act, task: e.target.value }
+                          setDraft({ ...draft, actionItems: next })
+                        }}
+                      />
+                      {act.uncertain && <span className="draft-badge uncertain">Uncertain</span>}
+                    </div>
+                    <div className="two-up" style={{ marginBottom: 0 }}>
+                      <input
+                        style={{ fontSize: '12px', padding: '6px 8px' }}
+                        placeholder="Owner (optional)"
+                        value={act.owner || ''}
+                        onChange={(e) => {
+                          const next = [...draft.actionItems]
+                          next[i] = { ...act, owner: e.target.value || null, uncertain: !e.target.value || !act.dueDate }
+                          setDraft({ ...draft, actionItems: next })
+                        }}
+                      />
+                      <input
+                        style={{ fontSize: '12px', padding: '6px 8px' }}
+                        placeholder="Due Date (optional)"
+                        value={act.dueDate || ''}
+                        onChange={(e) => {
+                          const next = [...draft.actionItems]
+                          next[i] = { ...act, dueDate: e.target.value || null, uncertain: !act.owner || !e.target.value }
+                          setDraft({ ...draft, actionItems: next })
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {draft.uncertainties.length > 0 && (
+              <div className="uncertainty-box">
+                <b style={{ display: 'block', marginBottom: '6px' }}>Identified Source Uncertainties</b>
+                <div style={{ display: 'grid', gap: '4px' }}>
+                  {draft.uncertainties.map((u, i) => (
+                    <input
+                      key={i}
+                      className="field"
+                      style={{ fontSize: '12px', padding: '4px 8px', marginBottom: 0 }}
+                      value={u}
+                      onChange={(e) => {
+                        const next = [...draft.uncertainties]
+                        next[i] = e.target.value
+                        setDraft({ ...draft, uncertainties: next })
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginTop: '16px', display: 'grid', gap: '8px' }}>
+              {saveMessage && (
+                <div className="status-banner success" role="status" style={{ margin: 0 }}>
+                  ✓ {saveMessage}
+                </div>
+              )}
+              {saveError && (
+                <div className="status-banner error" role="alert" style={{ margin: 0 }}>
+                  ⚠ {saveError}
+                </div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <button
+                  type="button"
+                  className="button primary"
+                  disabled={isSaving}
+                  onClick={handleSaveDraft}
+                >
+                  {isSaving ? 'Saving edits…' : 'Save draft edits'}
+                </button>
+              </div>
+            </div>
+
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
 function Workspace({ module }: { module: ModuleDefinition }) {
-  const [notice, setNotice] = useState<string>(), [earlierFiles, setEarlierFiles] = useState<LocalFile[]>([]), [revisedFiles, setRevisedFiles] = useState<LocalFile[]>([]), [shieldFiles, setShieldFiles] = useState<LocalFile[]>([]), [ragFiles, setRagFiles] = useState<LocalFile[]>([]), [translateFiles, setTranslateFiles] = useState<LocalFile[]>([]), [audioFiles, setAudioFiles] = useState<LocalFile[]>([]), [transcriptFiles, setTranscriptFiles] = useState<LocalFile[]>([])
+  const [notice, setNotice] = useState<string>()
   const unavailable = (task: string) => setNotice(`${task} requires a configured server-side provider. No file was uploaded or processed.`)
   const documentTypes = ['.pdf', '.docx', '.txt']
-  const body = module.id === 'change' ? <div className="workspace-flow"><div className="two-up"><FileQueue title="Earlier version" accept={documentTypes} files={earlierFiles} onChange={setEarlierFiles} multiple={false} hint="PDF, DOCX, or TXT · up to 20 MB" /><FileQueue title="Revised version" accept={documentTypes} files={revisedFiles} onChange={setRevisedFiles} multiple={false} hint="PDF, DOCX, or TXT · up to 20 MB" /></div><button className="button primary" disabled={!earlierFiles.length || !revisedFiles.length} onClick={() => unavailable('Document comparison')}>Compare versions</button></div> : module.id === 'rag' ? <div className="workspace-flow"><label className="field">Collection name<input placeholder="e.g. Admissions policies" /></label><FileQueue title="Add documents to start a collection" accept={documentTypes} files={ragFiles} onChange={setRagFiles} hint="PDF, DOCX, or TXT · up to 20 MB each" /><p className="integration-state">{ragFiles.length ? 'Documents are selected in this browser. Upload, extraction, and indexing require a configured secure service.' : 'Select documents before a collection can be indexed.'}</p><label className="field">Question<textarea placeholder="Ask a question grounded in your collection…" /></label><button className="button primary" disabled={!ragFiles.length} onClick={() => unavailable('Retrieval and answer generation')}>Ask collection</button><section className="evidence-panel"><b>Grounded answer & evidence</b><p>No answer is available until the selected documents have been securely indexed and retrieved.</p></section></div> : module.id === 'shield' ? <div className="workspace-flow"><FileQueue title="Private document" accept={documentTypes} files={shieldFiles} onChange={setShieldFiles} multiple={false} hint="PDF, DOCX, or TXT · up to 20 MB" /><button className="button primary" disabled={!shieldFiles.length} onClick={() => unavailable('Privacy scanning')}>Inspect content</button></div> : module.id === 'translate' ? <div className="workspace-flow"><FileQueue title="Upload institutional document" accept={documentTypes} files={translateFiles} onChange={setTranslateFiles} hint="PDF, DOCX, or TXT · up to 20 MB each" /><div className="two-up"><label className="field">Source language<select defaultValue="English"><option>English</option><option>Tamil</option><option>Hindi</option><option>Telugu</option><option>Kannada</option><option>Malayalam</option></select></label><label className="field">Target language<select defaultValue="Tamil"><option>Tamil</option><option>Hindi</option><option>Telugu</option><option>Kannada</option><option>Malayalam</option><option>Bengali</option><option>Marathi</option></select></label></div><label className="field">Optional source text<textarea placeholder="Paste a short passage only when a document is not available…" /></label><p className="integration-state">Document extraction, language support, translation, review and export remain unavailable until a provider is configured. The original file stays unchanged.</p><button className="button primary" disabled={!translateFiles.length} onClick={() => unavailable('Document translation')}>Extract and translate</button><section className="translation-review"><b>Translation review</b><p>Original and translated content will appear here side by side after real extraction and translation are available.</p></section></div> : <div className="workspace-flow meeting-flow"><FileQueue title="Upload audio recording" accept={['.mp3', '.wav', '.m4a']} files={audioFiles} onChange={setAudioFiles} hint="MP3, WAV, or M4A · up to 200 MB each" maxMb={200} /><FileQueue title="Upload transcript" accept={['.txt', '.docx', '.pdf', '.vtt', '.srt']} files={transcriptFiles} onChange={setTranscriptFiles} hint="TXT, DOCX, PDF, VTT, or SRT · up to 20 MB each" /><p className="integration-state">Use audio, a transcript, or both. Transcription and reconciliation require a configured secure service; no draft minutes will be fabricated.</p><button className="button primary" disabled={!audioFiles.length && !transcriptFiles.length} onClick={() => unavailable('Minutes generation')}>Generate draft minutes</button><section className="minutes-draft"><b>Reviewable minutes draft</b><p>A generated draft will remain editable and will identify uncertain decisions, owners, and deadlines for review.</p></section></div>
-  return <main className="app-page content"><header className="page-header"><p className="eyebrow">{module.name} · Independent workspace</p><h1>{module.workspaceTitle}</h1><p className="lede">{module.workspaceDescription}</p></header><section className="workspace-panel"><h2>{module.id === 'rag' ? 'Document-grounded collection' : module.id === 'translate' ? 'Institutional document translation' : module.id === 'meeting' ? 'Source to reviewable minutes' : 'Main input'}</h2><p>Local file selection is available. Secure upload and live processing are configured separately.</p>{body}{notice && <p className="notice" role="status">{notice}</p>}</section></main>
+  const [earlierFiles, setEarlierFiles] = useState<LocalFile[]>([])
+  const [revisedFiles, setRevisedFiles] = useState<LocalFile[]>([])
+  const [shieldFiles, setShieldFiles] = useState<LocalFile[]>([])
+
+  let body = null
+  if (module.id === 'change') {
+    body = (
+      <div className="workspace-flow">
+        <div className="two-up">
+          <FileQueue title="Earlier version" accept={documentTypes} files={earlierFiles} onChange={setEarlierFiles} multiple={false} hint="PDF, DOCX, or TXT · up to 20 MB" />
+          <FileQueue title="Revised version" accept={documentTypes} files={revisedFiles} onChange={setRevisedFiles} multiple={false} hint="PDF, DOCX, or TXT · up to 20 MB" />
+        </div>
+        <button className="button primary" disabled={!earlierFiles.length || !revisedFiles.length} onClick={() => unavailable('Document comparison')}>
+          Compare versions
+        </button>
+      </div>
+    )
+  } else if (module.id === 'shield') {
+    body = (
+      <div className="workspace-flow">
+        <FileQueue title="Private document" accept={documentTypes} files={shieldFiles} onChange={setShieldFiles} multiple={false} hint="PDF, DOCX, or TXT · up to 20 MB" />
+        <button className="button primary" disabled={!shieldFiles.length} onClick={() => unavailable('Privacy scanning')}>
+          Inspect content
+        </button>
+      </div>
+    )
+  } else if (module.id === 'rag') {
+    body = <RagWorkspace />
+  } else if (module.id === 'translate') {
+    body = <TranslateWorkspace />
+  } else if (module.id === 'meeting') {
+    body = <MeetingWorkspace />
+  }
+
+  return (
+    <main className="app-page content">
+      <header className="page-header">
+        <p className="eyebrow">{module.name} · Independent workspace</p>
+        <h1>{module.workspaceTitle}</h1>
+        <p className="lede">{module.workspaceDescription}</p>
+      </header>
+      <section className="workspace-panel">
+        <h2>
+          {module.id === 'rag'
+            ? 'Document-grounded collection'
+            : module.id === 'translate'
+            ? 'Institutional document translation'
+            : module.id === 'meeting'
+            ? 'Source to reviewable minutes'
+            : 'Main input'}
+        </h2>
+        <p>
+          {module.id === 'rag' || module.id === 'translate' || module.id === 'meeting'
+            ? 'Connected to local institutional intelligence service.'
+            : 'Local file selection is available. Secure upload and live processing are configured separately.'}
+        </p>
+        {body}
+        {notice && <p className="notice" role="status">{notice}</p>}
+      </section>
+    </main>
+  )
 }
+
 
 export function App() { const { route, navigate } = useRoute(); const content = route.kind === 'landing' ? <Landing navigate={navigate} /> : route.kind === 'suite' ? <Suite navigate={navigate} /> : route.kind === 'workflow' ? <Workflow module={moduleById(route.id)} navigate={navigate} /> : <Workspace module={moduleById(route.id)} />; return <><BackDock route={route} navigate={navigate} />{content}</> }
