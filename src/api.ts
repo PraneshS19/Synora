@@ -39,6 +39,15 @@ export type TranslationSegment = {
   translated: string
   reviewFlag: 'unreviewed' | 'approved' | 'edited' | 'no_model'
   confidence: number
+  blockType?: string
+  blockLevel?: number
+  styleName?: string
+  tableIndex?: number
+  rowIndex?: number
+  cellIndex?: number
+  numRows?: number
+  numCols?: number
+  blockOrder?: number
 }
 
 export type TranslationJob = {
@@ -50,6 +59,8 @@ export type TranslationJob = {
   limitations: string[]
   error?: string
   providerUsed?: string
+  sourceFileName?: string
+  sourceFileExt?: string
 }
 
 export type DiscussionTopic = {
@@ -85,9 +96,19 @@ export type MeetingJob = {
   status: 'queued' | 'processing' | 'completed' | 'failed'
   source: 'transcript' | 'audio' | 'hybrid'
   draft?: MeetingDraft
+  transcript?: string
+  audioFileName?: string
+  createdAt?: string
+  updatedAt?: string
   limitations: string[]
   error?: string
   providerUsed?: string
+}
+
+export type TranscribeAudioResponse = {
+  transcript: string
+  audioFileName: string
+  providerUsed: string
 }
 
 const API_BASE = (import.meta.env.VITE_API_URL || '/api').replace(/\/$/, '')
@@ -193,10 +214,20 @@ export async function updateTranslationSegment(
   return handleResponse<TranslationJob>(res)
 }
 
+export async function transcribeMeetingAudio(audioFileId: string): Promise<TranscribeAudioResponse> {
+  const res = await safeFetch(`${API_BASE}/meetings/transcribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ audioFileId }),
+  })
+  return handleResponse<TranscribeAudioResponse>(res)
+}
+
 export async function createMeetingJob(params: {
   transcriptFileIds?: string[]
   audioFileIds?: string[]
   meetingTitle?: string
+  rawTranscriptText?: string
 }): Promise<MeetingJob> {
   const res = await safeFetch(`${API_BASE}/meetings/jobs`, {
     method: 'POST',
@@ -221,6 +252,28 @@ export async function getLatestMeetingJob(): Promise<MeetingJob | null> {
   }
 }
 
+export async function listMeetingJobs(): Promise<MeetingJob[]> {
+  const res = await safeFetch(`${API_BASE}/meetings/jobs`)
+  return handleResponse<MeetingJob[]>(res)
+}
+
+export async function downloadMeetingDocx(jobId: string): Promise<{ blob: Blob; filename: string }> {
+  const res = await safeFetch(`${API_BASE}/meetings/jobs/${jobId}/download`)
+  if (!res.ok) {
+    let message = `Download failed with status ${res.status}`
+    try {
+      const errData = await res.json()
+      if (errData?.detail) message = errData.detail
+    } catch {}
+    throw new Error(message)
+  }
+  const blob = await res.blob()
+  const contentDisposition = res.headers.get('Content-Disposition') || ''
+  const match = contentDisposition.match(/filename="([^"]+)"/)
+  const filename = match ? match[1] : `meeting-minutes-${jobId}.docx`
+  return { blob, filename }
+}
+
 export async function updateMeetingDraft(jobId: string, draft: MeetingDraft): Promise<MeetingJob> {
   const res = await safeFetch(`${API_BASE}/meetings/jobs/${jobId}/draft`, {
     method: 'PUT',
@@ -229,3 +282,21 @@ export async function updateMeetingDraft(jobId: string, draft: MeetingDraft): Pr
   })
   return handleResponse<MeetingJob>(res)
 }
+
+export async function downloadTranslatedDocument(jobId: string, format: string = 'auto'): Promise<{ blob: Blob; filename: string }> {
+  const res = await safeFetch(`${API_BASE}/translate/jobs/${jobId}/download?format=${format}`)
+  if (!res.ok) {
+    let message = `Download failed with status ${res.status}`
+    try {
+      const errData = await res.json()
+      if (errData?.detail) message = errData.detail
+    } catch {}
+    throw new Error(message)
+  }
+  const blob = await res.blob()
+  const contentDisposition = res.headers.get('Content-Disposition') || ''
+  const match = contentDisposition.match(/filename="([^"]+)"/)
+  const filename = match ? match[1] : `translation-${jobId}.txt`
+  return { blob, filename }
+}
+

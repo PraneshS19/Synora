@@ -1,6 +1,7 @@
 import re
 import json
 import uuid
+from pathlib import Path
 from typing import Optional
 from fastapi import HTTPException
 
@@ -50,70 +51,138 @@ class TranslationService:
                 detail=f"Target language '{target_lang}' is not supported. Supported: {', '.join(sorted(SUPPORTED_TARGET_LANGUAGES))}"
             )
 
-        # Collect raw text
-        raw_texts: list[str] = []
-        if source_text and source_text.strip():
-            raw_texts.append(source_text.strip())
+        source_file_name = None
+        source_file_ext = None
+        if file_ids:
+            rec = self.storage.get_file_record(file_ids[0])
+            if rec:
+                source_file_name = rec.get("original_name")
+                source_file_ext = Path(source_file_name).suffix.lower() if source_file_name else None
 
-        for fid in file_ids:
+        # Check if source is a single DOCX upload to preserve document structure
+        is_structured_docx = (
+            len(file_ids) == 1
+            and not (source_text and source_text.strip())
+            and source_file_ext == ".docx"
+        )
+
+        doc_blocks = None
+        raw_segments = []
+        if is_structured_docx:
+            fid = file_ids[0]
             record = self.storage.get_file_record(fid)
             if not record:
                 raise HTTPException(status_code=404, detail=f"File ID '{fid}' not found.")
             file_path = self.storage.get_file_path(fid)
-            if file_path and file_path.exists():
-                passages = DocumentExtractor.extract_from_path(file_path)
-                for p in passages:
-                    if p.text.strip():
-                        raw_texts.append(p.text.strip())
+            if not file_path or not file_path.exists():
+                raise HTTPException(status_code=404, detail="Uploaded file missing on disk.")
+            try:
+                doc_blocks = DocumentExtractor.extract_structured_docx(file_path)
+            except RuntimeError as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
-        if not raw_texts:
-            raise HTTPException(
-                status_code=400,
-                detail="No source content found. Please provide an uploaded document or source text."
-            )
+            texts_to_translate = [b.text for b in doc_blocks if b.text.strip()]
+            if not texts_to_translate:
+                raise HTTPException(status_code=400, detail="No readable text found in document.")
 
-        full_content = "\n\n".join(raw_texts)
+        else:
+            raw_texts: list[str] = []
+            if source_text and source_text.strip():
+                raw_texts.append(source_text.strip())
 
-        # Segment content into sentences / clauses
-        raw_segments = [
-            s.strip()
-            for s in re.split(r"(?<=[.!?\n])\s+", full_content)
-            if s.strip() and len(s.strip()) > 3
-        ]
+            for fid in file_ids:
+                record = self.storage.get_file_record(fid)
+                if not record:
+                    raise HTTPException(status_code=404, detail=f"File ID '{fid}' not found.")
+                file_path = self.storage.get_file_path(fid)
+                if file_path and file_path.exists():
+                    try:
+                        passages = DocumentExtractor.extract_from_path(file_path)
+                        for p in passages:
+                            if p.text.strip():
+                                raw_texts.append(p.text.strip())
+                    except RuntimeError as e:
+                        raise HTTPException(status_code=400, detail=str(e))
 
-        if not raw_segments:
-            raw_segments = [full_content[:500]]
+            if not raw_texts:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No source content found. Please provide an uploaded document or source text."
+                )
+
+            full_content = "\n\n".join(raw_texts)
+
+            # Segment content into sentences / clauses
+            raw_segments = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?\n])\s+", full_content)
+                if s.strip() and len(s.strip()) > 3
+            ]
+
+            if not raw_segments:
+                raw_segments = [full_content[:500]]
+
+            texts_to_translate = raw_segments
 
         # Record queued job
         with self.storage._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO translation_jobs (id, status, source_lang, target_lang, segments_json, error)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO translation_jobs (id, status, source_lang, target_lang, segments_json, error, source_file_name, source_file_ext)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, "processing", source_lang, target_lang, "[]", None)
+                (job_id, "processing", source_lang, target_lang, "[]", None, source_file_name, source_file_ext)
             )
             conn.commit()
 
         try:
             from app.providers.translation import LocalTranslationProvider
             provider = get_translation_provider()
-            translated_texts = provider.translate_segments(raw_segments, source_lang, target_lang)
+            translated_results = provider.translate_segments(texts_to_translate, source_lang, target_lang)
 
-            is_unconfigured = isinstance(provider, (NullTranslationProvider, LocalTranslationProvider)) or all(not (t and t.strip()) for t in translated_texts)
+            is_unconfigured = isinstance(provider, (NullTranslationProvider, LocalTranslationProvider)) or all(not (t and t.strip()) for t in translated_results)
 
             segments: list[TranslationSegment] = []
-            for idx, (src, trans) in enumerate(zip(raw_segments, translated_texts), start=1):
-                is_seg_blank = not (trans and trans.strip())
-                flag = "no_model" if (is_unconfigured or is_seg_blank) else "unreviewed"
-                segments.append(TranslationSegment(
-                    id=f"seg-{idx}",
-                    source=src,
-                    translated=trans if not is_unconfigured else "",
-                    reviewFlag=flag,
-                    confidence=0.0 if (is_unconfigured or is_seg_blank) else 0.92
-                ))
+            if is_structured_docx and doc_blocks:
+                trans_iter = iter(translated_results)
+                for idx, block in enumerate(doc_blocks, start=1):
+                    if block.text.strip():
+                        trans = next(trans_iter, "")
+                    else:
+                        trans = ""
+                    is_seg_blank = not (trans and trans.strip())
+                    flag = "no_model" if (is_unconfigured or is_seg_blank) else "unreviewed"
+                    segments.append(TranslationSegment(
+                        id=f"seg-{idx}",
+                        source=block.text,
+                        translated=trans if not is_unconfigured else "",
+                        reviewFlag=flag,
+                        confidence=0.0 if (is_unconfigured or is_seg_blank) else 0.92,
+                        blockType=block.block_type,
+                        blockLevel=block.block_level,
+                        styleName=block.style_name,
+                        tableIndex=block.table_index,
+                        rowIndex=block.row_index,
+                        cellIndex=block.cell_index,
+                        numRows=block.num_rows,
+                        numCols=block.num_cols,
+                        blockOrder=block.block_order,
+                    ))
+            else:
+                for idx, (src, trans) in enumerate(zip(raw_segments, translated_results), start=1):
+                    is_seg_blank = not (trans and trans.strip())
+                    flag = "no_model" if (is_unconfigured or is_seg_blank) else "unreviewed"
+                    segments.append(TranslationSegment(
+                        id=f"seg-{idx}",
+                        source=src,
+                        translated=trans if not is_unconfigured else "",
+                        reviewFlag=flag,
+                        confidence=0.0 if (is_unconfigured or is_seg_blank) else 0.92,
+                        blockType="paragraph",
+                        blockLevel=0,
+                        blockOrder=idx,
+                    ))
 
             segments_json = json.dumps([s.model_dump() for s in segments])
 
@@ -126,7 +195,7 @@ class TranslationService:
                 conn.commit()
 
             limitations = [
-                "No translation model is configured. Translated segments are blank; configure a translation provider (IndicTrans2 or Gemini) or enter translations manually."
+                "No translation model is configured. Translated segments are blank; configure a translation provider (IndicTrans2) or enter translations manually."
             ] if is_unconfigured else [
                 "Machine translation draft. Human review required before institutional publication."
             ]
@@ -138,7 +207,9 @@ class TranslationService:
                 targetLanguage=target_lang,
                 segments=segments,
                 limitations=limitations,
-                providerUsed=provider.__class__.__name__
+                providerUsed=provider.__class__.__name__,
+                sourceFileName=source_file_name,
+                sourceFileExt=source_file_ext,
             )
 
         except Exception as e:
@@ -157,7 +228,9 @@ class TranslationService:
                 sourceLanguage=source_lang,
                 targetLanguage=target_lang,
                 segments=[],
-                error=err_msg
+                error=err_msg,
+                sourceFileName=source_file_name,
+                sourceFileExt=source_file_ext,
             )
 
     def get_job(self, job_id: str) -> Optional[TranslationJobResponse]:
@@ -178,6 +251,7 @@ class TranslationService:
                 "Machine translation draft. Human review required before institutional publication."
             ]
 
+            keys = row.keys()
             return TranslationJobResponse(
                 id=row["id"],
                 status=row["status"],
@@ -185,7 +259,9 @@ class TranslationService:
                 targetLanguage=row["target_lang"],
                 segments=segments,
                 limitations=limitations,
-                error=row["error"]
+                error=row["error"],
+                sourceFileName=row["source_file_name"] if "source_file_name" in keys else None,
+                sourceFileExt=row["source_file_ext"] if "source_file_ext" in keys else None,
             )
 
     def update_segment(self, job_id: str, segment_id: str, new_translated: str, review_flag: str = "edited") -> TranslationJobResponse:

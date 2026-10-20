@@ -1,11 +1,14 @@
 import re
 import json
 import uuid
+from pathlib import Path
 from typing import Optional
 from fastapi import HTTPException
 
+from app.config import settings
 from app.services.storage import storage_service
 from app.services.extractor import DocumentExtractor, DocumentPassage
+from app.services.meeting_docx_builder import build_meeting_docx
 from app.providers.audio import get_audio_provider
 from app.providers.llm import get_llm_provider, LocalExtractiveLLMProvider
 from app.models.schemas import (
@@ -14,76 +17,135 @@ from app.models.schemas import (
     DiscussionTopic,
     MeetingDecision,
     ActionItem,
+    TranscribeAudioResponse,
 )
 
 class MeetingService:
     def __init__(self):
         self.storage = storage_service
 
+    def transcribe_audio(self, audio_file_id: str) -> TranscribeAudioResponse:
+        record = self.storage.get_file_record(audio_file_id)
+        if not record:
+            raise HTTPException(status_code=404, detail=f"Audio file '{audio_file_id}' not found.")
+        file_path = self.storage.get_file_path(audio_file_id)
+        if not file_path or not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"Audio file '{record['original_name']}' is missing on disk.")
+
+        try:
+            audio_provider = get_audio_provider()
+            passages = audio_provider.transcribe(file_path)
+            if not passages:
+                raise RuntimeError(f"No audible speech could be transcribed from '{record['original_name']}'.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            err_msg = str(e)
+            # Sanitize local file system paths from error messages
+            err_msg = re.sub(r"[A-Za-z]:\\[\w\\\.\-]+", lambda m: Path(m.group(0)).name, err_msg)
+            err_msg = re.sub(r"/(?:[\w\.\-]+/)+[\w\.\-]+", lambda m: Path(m.group(0)).name, err_msg)
+            raise HTTPException(status_code=400, detail=err_msg)
+
+        formatted = "\n".join(
+            f"[{p.timestamp or p.section or '00:00'}]: {p.text}"
+            for p in passages
+        )
+        return TranscribeAudioResponse(
+            transcript=formatted,
+            audioFileName=record["original_name"],
+            providerUsed=settings.AUDIO_PROVIDER
+        )
+
     def create_job(
         self,
         transcript_file_ids: list[str],
         audio_file_ids: list[str],
-        meeting_title: Optional[str] = None
+        meeting_title: Optional[str] = None,
+        raw_transcript_text: Optional[str] = None
     ) -> MeetingJobResponse:
         job_id = str(uuid.uuid4())
 
-        if not transcript_file_ids and not audio_file_ids:
+        has_raw_text = bool(raw_transcript_text and raw_transcript_text.strip())
+        if not transcript_file_ids and not audio_file_ids and not has_raw_text:
             raise HTTPException(
                 status_code=400,
-                detail="Please provide at least one transcript or audio recording file."
+                detail="Please provide an audio recording, transcript file, or edited transcript text."
             )
 
-        source_type = "hybrid" if (transcript_file_ids and audio_file_ids) else "audio" if audio_file_ids else "transcript"
+        if has_raw_text and not audio_file_ids and not transcript_file_ids:
+            source_type = "transcript"
+        elif transcript_file_ids and audio_file_ids:
+            source_type = "hybrid"
+        elif audio_file_ids:
+            source_type = "audio"
+        else:
+            source_type = "transcript"
+
+        audio_file_name: Optional[str] = None
+        if audio_file_ids:
+            for afid in audio_file_ids:
+                rec = self.storage.get_file_record(afid)
+                if rec and not audio_file_name:
+                    audio_file_name = rec["original_name"]
 
         # Record initial job
         with self.storage._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO meeting_jobs (id, status, source_type, draft_json, error)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO meeting_jobs (id, status, source_type, draft_json, error, transcript, audio_file_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, "processing", source_type, None, None)
+                (job_id, "processing", source_type, None, None, None, audio_file_name)
             )
             conn.commit()
 
         try:
-            passages: list[DocumentPassage] = []
+            full_transcript: str = ""
 
-            # 1. Process audio files if provided
-            if audio_file_ids:
-                audio_provider = get_audio_provider()
-                for afid in audio_file_ids:
-                    record = self.storage.get_file_record(afid)
-                    if not record:
-                        raise HTTPException(status_code=404, detail=f"Audio file '{afid}' not found.")
-                    file_path = self.storage.get_file_path(afid)
-                    if not file_path or not file_path.exists():
-                        raise RuntimeError(f"Audio file '{record['original_name']}' is missing on disk.")
-                    audio_passages = audio_provider.transcribe(file_path)
-                    passages.extend(audio_passages)
+            if has_raw_text:
+                full_transcript = raw_transcript_text.strip()
+            else:
+                passages: list[DocumentPassage] = []
 
-            # 2. Process transcript files if provided
-            if transcript_file_ids:
-                for tfid in transcript_file_ids:
-                    record = self.storage.get_file_record(tfid)
-                    if not record:
-                        raise HTTPException(status_code=404, detail=f"Transcript file '{tfid}' not found.")
-                    file_path = self.storage.get_file_path(tfid)
-                    if not file_path or not file_path.exists():
-                        raise RuntimeError(f"Transcript file '{record['original_name']}' is missing on disk.")
-                    t_passages = DocumentExtractor.extract_from_path(file_path)
-                    passages.extend(t_passages)
+                # 1. Process audio files if provided
+                if audio_file_ids:
+                    audio_provider = get_audio_provider()
+                    for afid in audio_file_ids:
+                        record = self.storage.get_file_record(afid)
+                        if not record:
+                            raise HTTPException(status_code=404, detail=f"Audio file '{afid}' not found.")
+                        file_path = self.storage.get_file_path(afid)
+                        if not file_path or not file_path.exists():
+                            raise RuntimeError(f"Audio file '{record['original_name']}' is missing on disk.")
+                        audio_passages = audio_provider.transcribe(file_path)
+                        if not audio_passages:
+                            raise RuntimeError(f"No audible speech could be extracted from audio file '{record['original_name']}'.")
+                        passages.extend(audio_passages)
 
-            if not passages:
-                raise RuntimeError("No readable content could be extracted from the meeting sources.")
+                # 2. Process transcript files if provided
+                if transcript_file_ids:
+                    for tfid in transcript_file_ids:
+                        record = self.storage.get_file_record(tfid)
+                        if not record:
+                            raise HTTPException(status_code=404, detail=f"Transcript file '{tfid}' not found.")
+                        file_path = self.storage.get_file_path(tfid)
+                        if not file_path or not file_path.exists():
+                            raise RuntimeError(f"Transcript file '{record['original_name']}' is missing on disk.")
+                        t_passages = DocumentExtractor.extract_from_path(file_path)
+                        passages.extend(t_passages)
 
-            # Compile text for drafting
-            full_transcript = "\n".join(
-                f"[{p.timestamp or p.section or 'General'}]: {p.text}"
-                for p in passages
-            )
+                if not passages:
+                    raise RuntimeError("No readable content could be extracted from the meeting sources.")
+
+                # Compile text for drafting
+                full_transcript = "\n".join(
+                    f"[{p.timestamp or p.section or 'General'}]: {p.text}"
+                    for p in passages
+                )
+
+            if not full_transcript.strip():
+                raise RuntimeError("No readable speech or text was extracted to generate minutes.")
 
             # Generate draft minutes
             draft = self._generate_draft(full_transcript, meeting_title)
@@ -92,8 +154,8 @@ class MeetingService:
             with self.storage._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "UPDATE meeting_jobs SET status = 'completed', draft_json = ? WHERE id = ?",
-                    (draft_json, job_id)
+                    "UPDATE meeting_jobs SET status = 'completed', draft_json = ?, transcript = ?, audio_file_name = ? WHERE id = ?",
+                    (draft_json, full_transcript, audio_file_name, job_id)
                 )
                 conn.commit()
 
@@ -101,11 +163,17 @@ class MeetingService:
                 id=job_id,
                 status="completed",
                 source=source_type,
-                draft=draft
+                draft=draft,
+                transcript=full_transcript,
+                audioFileName=audio_file_name,
+                providerUsed=settings.AUDIO_PROVIDER if audio_file_ids else None
             )
 
         except Exception as e:
             err_msg = str(e)
+            # Sanitize server directory paths
+            err_msg = re.sub(r"[A-Za-z]:\\[\w\\\.\-]+", lambda m: Path(m.group(0)).name, err_msg)
+            err_msg = re.sub(r"/(?:[\w\.\-]+/)+[\w\.\-]+", lambda m: Path(m.group(0)).name, err_msg)
             with self.storage._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -119,13 +187,16 @@ class MeetingService:
                 status="failed",
                 source=source_type,
                 draft=None,
-                error=err_msg
+                transcript=None,
+                audioFileName=audio_file_name,
+                error=err_msg,
+                providerUsed=settings.AUDIO_PROVIDER if audio_file_ids else None
             )
 
     def _generate_draft(self, transcript: str, user_title: Optional[str]) -> MeetingDraft:
         llm = get_llm_provider()
-
-        # If external LLM is configured (e.g. Gemini / OpenAI)
+        
+        # If external LLM is configured (e.g. OpenAI)
         if not isinstance(llm, LocalExtractiveLLMProvider):
             system_instruction = (
                 "You are an institutional meeting minute generator. "
@@ -222,20 +293,36 @@ class MeetingService:
         statements: list[tuple[Optional[str], str]] = []
         for line in lines:
             content_line = line
-            sec_m = re.match(r"^\[.*?\]:\s*", line)
+            sec_m = re.match(r"^\[.*?\]\s*:?\s*", line)
             if sec_m:
                 content_line = line[sec_m.end():]
 
             speaker: Optional[str] = None
             content = content_line
-            spk_m = re.match(r"^([A-Z][a-zA-Z0-9_\s.\-]{0,40}?):\s+(.+)$", content_line)
+
             RESERVED_PREFIXES = {
                 "action", "action item", "todo", "task", "follow up",
-                "decision", "topic", "agenda", "note", "discussion"
+                "decision", "topic", "agenda", "note", "discussion",
+                "however", "moreover", "furthermore", "therefore", "meanwhile",
+                "in addition", "as discussed", "also", "finally", "firstly",
+                "secondly", "overall", "well", "yes", "no", "okay", "ok"
             }
-            if spk_m and spk_m.group(1).strip().lower() not in RESERVED_PREFIXES:
-                speaker = spk_m.group(1).strip()
-                content = spk_m.group(2).strip()
+
+            # 1. Speaker followed by colon: "Maya: I will..." or "Chair: We agreed..."
+            spk_colon = re.match(r"^([A-Z][a-zA-Z0-9_\s.\-]{0,40}?):\s+(.+)$", content_line)
+            if spk_colon and spk_colon.group(1).strip().lower() not in RESERVED_PREFIXES:
+                speaker = spk_colon.group(1).strip()
+                content = spk_colon.group(2).strip()
+            else:
+                # 2. Speaker followed by comma before first-person commitment: "Maya, I will..."
+                spk_comma = re.match(
+                    r"^([A-Z][a-zA-Z0-9_\s.\-]{0,40}?),\s+(?=(?:i\s+will|i'll|i\s+shall|i\s+can)\b)(.+)$",
+                    content_line,
+                    re.IGNORECASE
+                )
+                if spk_comma and spk_comma.group(1).strip().lower() not in RESERVED_PREFIXES:
+                    speaker = spk_comma.group(1).strip()
+                    content = spk_comma.group(2).strip()
 
             raw_sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", content) if s.strip()]
             for s in raw_sents:
@@ -421,12 +508,23 @@ class MeetingService:
             if row["draft_json"]:
                 draft = MeetingDraft(**json.loads(row["draft_json"]))
 
+            keys = row.keys()
+            transcript = row["transcript"] if "transcript" in keys else None
+            audio_file_name = row["audio_file_name"] if "audio_file_name" in keys else None
+            created_at = row["created_at"] if "created_at" in keys else None
+            updated_at = row["updated_at"] if "updated_at" in keys else None
+
             return MeetingJobResponse(
                 id=row["id"],
                 status=row["status"],
                 source=row["source_type"],
                 draft=draft,
-                error=row["error"]
+                transcript=transcript,
+                audioFileName=audio_file_name,
+                createdAt=created_at,
+                updatedAt=updated_at,
+                error=row["error"],
+                providerUsed=settings.AUDIO_PROVIDER if audio_file_name else None
             )
 
     def get_latest_job(self) -> Optional[MeetingJobResponse]:
@@ -439,18 +537,70 @@ class MeetingService:
             if not row:
                 return None
 
-
             draft = None
             if row["draft_json"]:
                 draft = MeetingDraft(**json.loads(row["draft_json"]))
+
+            keys = row.keys()
+            transcript = row["transcript"] if "transcript" in keys else None
+            audio_file_name = row["audio_file_name"] if "audio_file_name" in keys else None
+            created_at = row["created_at"] if "created_at" in keys else None
+            updated_at = row["updated_at"] if "updated_at" in keys else None
 
             return MeetingJobResponse(
                 id=row["id"],
                 status=row["status"],
                 source=row["source_type"],
                 draft=draft,
-                error=row["error"]
+                transcript=transcript,
+                audioFileName=audio_file_name,
+                createdAt=created_at,
+                updatedAt=updated_at,
+                error=row["error"],
+                providerUsed=settings.AUDIO_PROVIDER if audio_file_name else None
             )
+
+    def list_jobs(self, limit: int = 100) -> list[MeetingJobResponse]:
+        with self.storage._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM meeting_jobs
+                WHERE draft_json IS NOT NULL
+                ORDER BY COALESCE(updated_at, created_at) DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+            rows = cursor.fetchall()
+            jobs: list[MeetingJobResponse] = []
+            for row in rows:
+                draft = None
+                if row["draft_json"]:
+                    try:
+                        draft = MeetingDraft(**json.loads(row["draft_json"]))
+                    except Exception:
+                        pass
+
+                keys = row.keys()
+                transcript = row["transcript"] if "transcript" in keys else None
+                audio_file_name = row["audio_file_name"] if "audio_file_name" in keys else None
+                created_at = row["created_at"] if "created_at" in keys else None
+                updated_at = row["updated_at"] if "updated_at" in keys else None
+
+                jobs.append(MeetingJobResponse(
+                    id=row["id"],
+                    status=row["status"],
+                    source=row["source_type"],
+                    draft=draft,
+                    transcript=transcript,
+                    audioFileName=audio_file_name,
+                    createdAt=created_at,
+                    updatedAt=updated_at,
+                    error=row["error"],
+                    providerUsed=settings.AUDIO_PROVIDER if audio_file_name else None
+                ))
+            return jobs
 
     def update_draft(self, job_id: str, new_draft: MeetingDraft) -> MeetingJobResponse:
         job = self.get_job(job_id)
@@ -461,13 +611,32 @@ class MeetingService:
         with self.storage._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE meeting_jobs SET draft_json = ? WHERE id = ?",
+                "UPDATE meeting_jobs SET draft_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (draft_json, job_id)
             )
             conn.commit()
 
-        job.draft = new_draft
-        return job
+        updated = self.get_job(job_id)
+        return updated or job
+
+    def build_docx(self, job_id: str) -> tuple[bytes, str]:
+        job = self.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Meeting job not found.")
+        if not job.draft:
+            raise HTTPException(status_code=400, detail="Meeting job has no draft minutes available for download.")
+
+        docx_bytes = build_meeting_docx(job.draft, job)
+
+        # Sanitize filename from draft title
+        raw_title = job.draft.title or "meeting_minutes"
+        safe_title = re.sub(r"[^\w\s\-]+", "", raw_title).strip()
+        safe_title = re.sub(r"[\s\-]+", "_", safe_title)[:60].strip("_")
+        if not safe_title:
+            safe_title = "meeting_minutes"
+        filename = f"{safe_title}.docx"
+
+        return docx_bytes, filename
 
 
 meeting_service = MeetingService()

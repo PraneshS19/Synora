@@ -51,39 +51,11 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         normalized = arr / norms
         return normalized.tolist()
 
-class GeminiEmbeddingProvider(EmbeddingProvider):
-    def __init__(self, api_key: str, model: str = ""):
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is not set.")
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        self.provider_name = "gemini"
-        self.model = model or settings.GEMINI_EMBEDDING_MODEL or "models/gemini-embedding-001"
-        self.model_name = self.model
-        self.dimension = 768
-
-    def embed_query(self, text: str) -> list[float]:
-        import google.generativeai as genai
-        res = genai.embed_content(model=self.model, content=text, task_type="retrieval_query")
-        return res["embedding"]
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        import google.generativeai as genai
-        embeddings = []
-        for text in texts:
-            res = genai.embed_content(model=self.model, content=text, task_type="retrieval_document")
-            embeddings.append(res["embedding"])
-        return embeddings
-
 def get_embedding_provider() -> EmbeddingProvider:
     provider_name = settings.EMBEDDING_PROVIDER.lower()
     if provider_name == "local":
         return LocalEmbeddingProvider()
-    elif provider_name == "gemini":
-        if not settings.GEMINI_API_KEY:
-            raise RuntimeError("Gemini embedding provider requested, but GEMINI_API_KEY is not set.")
-        return GeminiEmbeddingProvider(settings.GEMINI_API_KEY, settings.GEMINI_EMBEDDING_MODEL)
     elif provider_name == "openai":
         raise NotImplementedError("OpenAI embedding provider configured but requires active OPENAI_API_KEY.")
     else:
-        raise ValueError(f"Unknown EMBEDDING_PROVIDER: '{provider_name}'. Supported: 'local', 'gemini'.")
+        raise ValueError(f"Unknown EMBEDDING_PROVIDER: '{provider_name}'. Supported: 'local'.")

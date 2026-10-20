@@ -2,6 +2,8 @@ import os
 import uuid
 import sqlite3
 import datetime
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 from fastapi import HTTPException, UploadFile
@@ -95,9 +97,22 @@ class StorageService:
                     target_lang TEXT NOT NULL,
                     segments_json TEXT,
                     error TEXT,
+                    source_file_name TEXT,
+                    source_file_ext TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Safely migrate existing databases (add columns if missing)
+            for col_name, col_type in [
+                ("source_file_name", "TEXT"),
+                ("source_file_ext", "TEXT"),
+            ]:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE translation_jobs ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS meeting_jobs (
                     id TEXT PRIMARY KEY,
@@ -108,6 +123,18 @@ class StorageService:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Safely migrate meeting_jobs columns if missing
+            for col_name, col_type in [
+                ("transcript", "TEXT"),
+                ("audio_file_name", "TEXT"),
+                ("updated_at", "TIMESTAMP"),
+            ]:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE meeting_jobs ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     def validate_file_content(self, filename: str, ext: str, content: bytes, module: str):
@@ -137,6 +164,8 @@ class StorageService:
         elif ext == ".wav":
             if not (content.startswith(b"RIFF") and b"WAVE" in content[:16]):
                 raise HTTPException(status_code=400, detail=f"File '{filename}' is not a valid WAV audio file.")
+            if len(content) < 44:
+                raise HTTPException(status_code=400, detail=f"Audio file '{filename}' contains incomplete WAV header data.")
         elif ext == ".m4a":
             if len(content) < 8 or b"ftyp" not in content[:16]:
                 raise HTTPException(status_code=400, detail=f"File '{filename}' is not a valid M4A audio file.")
@@ -152,6 +181,37 @@ class StorageService:
                 decoded = content.decode("utf-8")
                 if not decoded.strip():
                     raise HTTPException(status_code=400, detail=f"File '{filename}' contains only whitespace.")
+            except UnicodeDecodeError:
+                try:
+                    decoded = content.decode("latin-1")
+                    if not decoded.strip():
+                        raise HTTPException(status_code=400, detail=f"File '{filename}' contains only whitespace.")
+                except HTTPException:
+                    raise
+                except Exception:
+                    raise HTTPException(status_code=400, detail=f"File '{filename}' contains unreadable binary data.")
+
+        # Audio stream decodability check if ffmpeg is available
+        if ext in AUDIO_EXTENSIONS and shutil.which("ffmpeg"):
+            try:
+                proc = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-i", "pipe:0", "-t", "0.5", "-f", "null", "-"],
+                    input=content,
+                    capture_output=True,
+                    timeout=5
+                )
+                if proc.returncode != 0:
+                    err_msg = proc.stderr.decode("utf-8", errors="replace").strip()
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Audio file '{filename}' is corrupt or cannot be decoded: {err_msg[:200] if err_msg else 'Invalid audio stream.'}"
+                    )
+            except subprocess.TimeoutExpired:
+                raise HTTPException(status_code=400, detail=f"Audio file '{filename}' took too long to validate.")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
             except UnicodeDecodeError:
                 try:
                     decoded = content.decode("latin-1")

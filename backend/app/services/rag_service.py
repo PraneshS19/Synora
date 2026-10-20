@@ -20,7 +20,7 @@ class RagService:
 
     def create_collection(self, name: str, file_ids: list[str]) -> CollectionResponse:
         collection_id = str(uuid.uuid4())
-
+        
         # Verify files exist in storage
         valid_files = []
         for fid in file_ids:
@@ -59,14 +59,14 @@ class RagService:
         try:
             chunks_to_insert = []
             chunk_texts = []
-
+            
             for file_rec in valid_files:
                 file_path = self.storage.get_file_path(file_rec["id"])
                 if not file_path or not file_path.exists():
                     raise RuntimeError(f"File '{file_rec['original_name']}' is missing on disk.")
 
                 passages = DocumentExtractor.extract_from_path(file_path)
-
+                
                 # Chunk passages if they are too long (> 800 characters)
                 for passage in passages:
                     text = passage.text
@@ -233,7 +233,7 @@ class RagService:
             )
 
         top_chunks = chunk_data[:4]
-
+        
         # Build citations
         citations: list[Citation] = []
         context_parts: list[str] = []
