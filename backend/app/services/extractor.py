@@ -9,6 +9,18 @@ class DocumentPassage(BaseModel):
     section: Optional[str] = None
     timestamp: Optional[str] = None
 
+class DocumentBlock(BaseModel):
+    text: str
+    block_type: str = "paragraph"  # "heading", "bullet", "paragraph", "table_cell"
+    block_level: int = 0
+    style_name: Optional[str] = None
+    table_index: Optional[int] = None
+    row_index: Optional[int] = None
+    cell_index: Optional[int] = None
+    num_rows: Optional[int] = None
+    num_cols: Optional[int] = None
+    block_order: int = 0
+
 class DocumentExtractor:
     @staticmethod
     def extract_from_path(file_path: Path) -> list[DocumentPassage]:
@@ -23,6 +35,96 @@ class DocumentExtractor:
             return DocumentExtractor._extract_txt(file_path)
         else:
             raise ValueError(f"Unsupported file format for text extraction: {ext}")
+
+    @staticmethod
+    def extract_structured_docx(file_path: Path) -> list[DocumentBlock]:
+        import docx
+        from docx.text.paragraph import Paragraph
+        from docx.table import Table
+
+        doc = docx.Document(str(file_path))
+        blocks: list[DocumentBlock] = []
+        order = 0
+        table_idx = 0
+
+        for child in doc.element.body:
+            if child.tag.endswith('p'):
+                p = Paragraph(child, doc)
+                text = p.text.strip()
+                if not text:
+                    continue
+                style_name = p.style.name if p.style else ""
+
+                if style_name.startswith("Heading") or style_name in ("Title", "Subtitle"):
+                    level = 1
+                    match = re.search(r"\d+", style_name)
+                    if match:
+                        level = int(match.group(0))
+                    elif style_name == "Title":
+                        level = 0
+                    elif style_name == "Subtitle":
+                        level = 2
+                    blocks.append(DocumentBlock(
+                        text=text,
+                        block_type="heading",
+                        block_level=level,
+                        style_name=style_name,
+                        block_order=order,
+                    ))
+                    order += 1
+                elif (
+                    "bullet" in style_name.lower()
+                    or "list" in style_name.lower()
+                    or bool(p._element.xpath('./w:pPr/w:numPr'))
+                    or text.startswith(("\u2022", "-", "*", "\u25e6", "\u25aa", "\u25b6"))
+                ):
+                    clean_text = re.sub(r"^[\u2022\u25e6\u25aa\u25b6\-\*]\s*", "", text).strip() or text
+                    blocks.append(DocumentBlock(
+                        text=clean_text,
+                        block_type="bullet",
+                        block_level=0,
+                        style_name=style_name if ("bullet" in style_name.lower() or "list" in style_name.lower()) else "List Bullet",
+                        block_order=order,
+                    ))
+                    order += 1
+                else:
+                    blocks.append(DocumentBlock(
+                        text=text,
+                        block_type="paragraph",
+                        block_level=0,
+                        style_name=style_name or "Normal",
+                        block_order=order,
+                    ))
+                    order += 1
+
+            elif child.tag.endswith('tbl'):
+                tbl = Table(child, doc)
+                num_rows = len(tbl.rows)
+                num_cols = len(tbl.columns) if num_rows > 0 else 0
+                has_content = False
+                for r_idx, row in enumerate(tbl.rows):
+                    for c_idx, cell in enumerate(row.cells):
+                        cell_text = cell.text.strip()
+                        if cell_text:
+                            has_content = True
+                        blocks.append(DocumentBlock(
+                            text=cell_text,
+                            block_type="table_cell",
+                            block_level=0,
+                            table_index=table_idx,
+                            row_index=r_idx,
+                            cell_index=c_idx,
+                            num_rows=num_rows,
+                            num_cols=num_cols,
+                            block_order=order,
+                        ))
+                        order += 1
+                if has_content:
+                    table_idx += 1
+
+        if not any(b.text.strip() for b in blocks):
+            raise RuntimeError(f"No readable text could be extracted from DOCX '{file_path.name}'.")
+        return blocks
 
     @staticmethod
     def _extract_pdf(file_path: Path) -> list[DocumentPassage]:

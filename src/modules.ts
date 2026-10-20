@@ -45,7 +45,7 @@ export const modules: ModuleDefinition[] = [
     steps: [{ title: 'Source text', description: 'Start with text you want to translate.' }, { title: 'Select language', description: 'Choose a supported target language.' }, { title: 'Generate draft', description: 'Create a draft when configured.' }, { title: 'Review the draft', description: 'Edit and refine before use.' }],
   },
   {
-    id: 'meeting', number: '05', name: 'Meeting Minutes', eyebrow: 'Meeting intelligence',
+    id: 'meeting', number: '05', name: 'ForumNotes', eyebrow: 'Meeting intelligence',
     landingTitle: 'Conversations into\nclear outcomes.', landingDescription: 'Turn meeting content into structured minutes, decisions and action items that can be reviewed.',
     workflowTitle: 'Meeting record workflow', workflowHeading: 'From discussion\nto decisions.', workflowDescription: 'Turn meeting content into structured minutes, decisions and action items that can be reviewed.',
     workspaceTitle: 'Capture reviewable minutes.', workspaceDescription: 'Add a transcript or recording source and confirm incomplete details before finalization.',

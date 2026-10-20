@@ -32,7 +32,7 @@
 .review-tag.edited{background:rgba(140,190,255,.15);color:#a8d1ff;border-color:rgba(140,190,255,.3)}
 .review-tag.no-model{background:rgba(255,100,100,.15);color:#ff9999;border-color:rgba(255,100,100,.3);cursor:default}
 
-/* Meeting Minutes draft */
+/* ForumNotes draft */
 .draft-container{display:grid;gap:18px;margin-top:16px}
 .draft-card{padding:18px;border:1px solid var(--line);border-radius:10px;background:rgba(255,255,255,.025)}
 .draft-card h3{font-size:15px;margin:0 0 10px;color:var(--text);display:flex;align-items:center;justify-content:space-between}

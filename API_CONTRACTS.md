@@ -1,132 +1,302 @@
-# SYNORA API contracts
+# SYNORA integration contracts
 
-This document summarizes the FastAPI routes implemented for modules 02, 04, and 05. The source of truth is `backend/app/main.py` and `backend/app/models/schemas.py`; keep this document and the TypeScript API client in `src/api.ts` aligned when contracts change.
+This document details the implemented REST integration contracts connecting the SYNORA frontend with the FastAPI backend services for **Institutional RAG (02)**, **IndicTranslate (04)**, and **ForumNotes (05)**.
 
-Local API base URL: `http://127.0.0.1:8000`. The Vite development server proxies `/api/*` to this address.
+Selected files remain in the browser until the user triggers a task. Modules 01 (ChangeLens) and 03 (IndicShield) remain in prototype mode with clear notices that server providers are required.
 
-## Health
+---
+
+## Health Check
 
 `GET /api/health`
 
-Returns service status, supported backend modules, and configured provider names. This is a liveness/configuration response, not a readiness guarantee that optional models or external services are reachable.
+- **Purpose**: Verify backend service liveness, module readiness, and active provider configuration.
+- **Response**:
+  ```json
+  {
+    "status": "ok",
+    "version": "1.0.0",
+    "modules": ["rag", "translate", "meeting"],
+    "providers": {
+      "embeddings": "local",
+      "llm": "local",
+      "translation": "local",
+      "audio": "none"
+    }
+  }
+  ```
 
-## Upload files
+---
 
-`POST /api/uploads` (`multipart/form-data`)
+## Shared Upload
 
-Fields:
+`POST /api/uploads`
 
-- `files`: one or more selected files.
-- `module`: module identifier such as `rag`, `translate`, or `meeting`.
+- **Content-Type**: `multipart/form-data`
+- **Request Fields**:
+  - `files`: One or more files.
+  - `module`: Target module string (`"rag"`, `"translate"`, `"meeting"`, `"change"`, `"shield"`).
+- **Validation**:
+  - Validates extension, file size (up to 20MB for documents, up to 200MB for audio), MIME type, and magic bytes (PDF header `%PDF-`, DOCX ZIP header `PK\x03\x04`, WAV/MP3/M4A audio headers, text encoding).
+  - Generates secure internal UUIDs and stores files in a private directory outside web roots.
+- **Response**:
+  ```json
+  {
+    "files": [
+      {
+        "id": "7dfb642a-9cb8-4e89-8b06-03f16952d73f",
+        "name": "Academic_Calendar_2026.pdf",
+        "mimeType": "application/pdf",
+        "size": 142080,
+        "status": "ready",
+        "module": "rag"
+      }
+    ]
+  }
+  ```
 
-The backend applies module-specific extension, size, and file-content checks. Successful responses contain file metadata and generated internal IDs. Files are stored under `backend/data/` by default and are not served from the frontend. Do not upload sensitive production data to this local prototype.
+---
 
-## Module 02 — Institutional RAG
+## Institutional RAG (Module 02)
 
-### Create/index a collection
-
+### Create Collection
 `POST /api/rag/collections`
 
-```json
-{
-  "name": "Library Policy",
-  "fileIds": ["<uploaded-file-id>"]
-}
-```
+- **Request**:
+  ```json
+  {
+    "name": "Admissions Regulations",
+    "fileIds": ["7dfb642a-9cb8-4e89-8b06-03f16952d73f"]
+  }
+  ```
+- **Processing**: Extracts document passages, preserves page and section numbers, generates vector embeddings via configured `EmbeddingProvider`, and indexes passages in SQLite/vector store.
+- **Response**:
+  ```json
+  {
+    "id": "col-uuid",
+    "name": "Admissions Regulations",
+    "status": "ready",
+    "fileCount": 1,
+    "chunkCount": 14,
+    "embeddingProvider": "local",
+    "embeddingDim": 256
+  }
+  ```
 
-The service extracts passages, builds an index with the configured embedding provider, and returns collection status and embedding metadata.
+### Get Collection
+`GET /api/rag/collections/:id`
 
-### Read a collection
+- **Response**: Current collection status, embedding metadata, and chunk metrics.
 
-`GET /api/rag/collections/{collection_id}`
+### Query Collection
+`POST /api/rag/collections/:id/questions`
 
-### Ask a question
+- **Request**:
+  ```json
+  {
+    "question": "When does the admissions portal close?"
+  }
+  ```
+- **Dimension Compatibility Guard**: Returns `409 Conflict` if the stored collection's vector dimension differs from the currently configured `EMBEDDING_PROVIDER`.
+- **Response (Evidence Found)**:
+  ```json
+  {
+    "answer": "The annual student admissions portal opens on July 15 and closes on August 30.",
+    "citations": [
+      {
+        "fileId": "7dfb642a-9cb8-4e89-8b06-03f16952d73f",
+        "name": "Academic_Calendar_2026.pdf",
+        "page": 4,
+        "section": "Page 4",
+        "excerpt": "Section 4: The annual student admissions portal opens on July 15 and closes on August 30."
+      }
+    ],
+    "evidenceFound": true,
+    "providerUsed": "LocalExtractiveLLMProvider"
+  }
+  ```
+- **Response (No Evidence Found)**:
+  ```json
+  {
+    "answer": "No sufficient evidence was found in the private collection to answer this question.",
+    "citations": [],
+    "evidenceFound": false,
+    "providerUsed": "LocalEmbeddingProvider"
+  }
+  ```
 
-`POST /api/rag/collections/{collection_id}/questions`
+---
 
-```json
-{ "question": "How many books may a student borrow?" }
-```
+## IndicTranslate (Module 04)
 
-The response includes `answer`, `citations`, `evidenceFound`, and `providerUsed`. Citations include source file metadata and an excerpt, with page/section information when available. When the collection has insufficient evidence, the expected response has `evidenceFound: false` and an empty citations list. A collection indexed with an incompatible embedding provider/dimension must be re-indexed rather than queried against incompatible vectors.
-
-## Module 04 — IndicTranslate
-
-### Create a translation job
-
+### Create Translation Job
 `POST /api/translate/jobs`
 
-```json
-{
-  "sourceText": "The meeting will begin tomorrow.",
-  "sourceLanguage": "English",
-  "targetLanguage": "Tamil"
-}
-```
+- **Request**:
+  ```json
+  {
+    "fileIds": ["file-uuid"],
+    "sourceText": "Optional direct passage if no file uploaded",
+    "sourceLanguage": "English",
+    "targetLanguage": "Tamil"
+  }
+  ```
+- **Response**:
+  ```json
+  {
+    "id": "job-uuid",
+    "status": "completed",
+    "sourceLanguage": "English",
+    "targetLanguage": "Tamil",
+    "segments": [
+      {
+        "id": "seg-1",
+        "source": "The academic council approved the new admissions policy for the institution.",
+        "translated": "கல்விசார் மன்றம் நிறுவனம் மாணவர் சேர்க்கை கொள்கை ஒப்புதல் அளித்தது.",
+        "reviewFlag": "unreviewed",
+        "confidence": 0.92
+      }
+    ],
+    "limitations": [
+      "Machine translation draft. Human review required before institutional publication."
+    ]
+  }
+  ```
 
-The request may instead include uploaded `fileIds`. The response contains a job ID, status, source/target language, segments, provider name, limitations, and any error.
+### Get Translation Job
+`GET /api/translate/jobs/:id`
 
-- With `TRANSLATION_PROVIDER=local` or `none`, translations are intentionally blank and marked as not machine-translated; users may enter drafts manually.
-- With `TRANSLATION_PROVIDER=indictrans2`, local model weights and dependencies must already be installed. The tested checkpoint supports English-to-Indic translation for the seven target languages in the UI. Other source directions are not supported by that tested configuration.
-- Generated machine translations require human review; they are not automatically approved.
+- Returns job status, segment pairs, and limitations.
 
-### Read a job
+### Update Translation Segment (Human Review)
+`PUT /api/translate/jobs/:id/segments/:segment_id`
 
-`GET /api/translate/jobs/{job_id}`
+- **Request**:
+  ```json
+  {
+    "translated": "கல்விசார் மன்றம் புதிய சேர்க்கைக் கொள்கைக்கு ஒப்புதல் அளித்தது.",
+    "reviewFlag": "edited"
+  }
+  ```
+- **Response**: Updated `TranslationJobResponse`.
 
-### Save a segment review/edit
+---
 
-`PUT /api/translate/jobs/{job_id}/segments/{segment_id}`
+## ForumNotes (Module 05)
 
-```json
-{
-  "translated": "<reviewed translation>",
-  "reviewFlag": "edited"
-}
-```
+### Transcribe Audio Recording
+`POST /api/meetings/transcribe`
 
-Allowed review states are defined in the schemas and frontend client. The service persists segment changes in the local database.
+- **Request**:
+  ```json
+  {
+    "audioFileId": "audio-file-uuid"
+  }
+  ```
+- **Processing**:
+  - Transcribes audio locally using OpenAI Whisper (`WHISPER_DEVICE=auto|cuda|cpu`).
+  - Preserves segment timestamps `[MM:SS - MM:SS]`.
+  - Rejects empty recordings or unsupported audio with clear error messages.
+  - Never invents fictional speaker names (no unverified diarization).
+- **Response**:
+  ```json
+  {
+    "transcript": "[00:00 - 00:20]: Good morning everyone. We are starting the review.\n[00:20 - 00:50]: We agreed to organize the technical workshop on 14 November 2026.",
+    "audioFileName": "workshop_recording.mp3",
+    "providerUsed": "whisper"
+  }
+  ```
 
-## Module 05 — Meeting Minutes
-
-### Create a minutes job
-
+### Create Meeting Job
 `POST /api/meetings/jobs`
 
-```json
-{
-  "transcriptFileIds": ["<uploaded-transcript-id>"],
-  "audioFileIds": [],
-  "meetingTitle": "Library Renovation Meeting"
-}
-```
-
-The response contains job status and, when successful, an editable draft with title, summary, discussion topics, decisions, action items, uncertainties, and human-review limitations. Items should be grounded in transcript content; owner/date information is not invented. Text transcript formats depend on the extractor and upload validation. Audio processing is unavailable unless an audio provider is installed and configured.
-
-### Read a job
-
-- `GET /api/meetings/jobs/{job_id}` — retrieve a specific job and its saved draft.
-- `GET /api/meetings/jobs/latest` — retrieve the most recent job for restoring the workspace.
-
-### Save draft edits
-
-`PUT /api/meetings/jobs/{job_id}/draft`
-
-```json
-{
-  "draft": {
-    "title": "Library Renovation Meeting",
-    "summary": "<edited summary>",
-    "discussions": [],
-    "decisions": [],
-    "actionItems": [],
-    "uncertainties": []
+- **Request**:
+  ```json
+  {
+    "transcriptFileIds": ["transcript-file-uuid"],
+    "audioFileIds": ["audio-file-uuid"],
+    "rawTranscriptText": "[00:00 - 00:20]: Dr. Raman: Good morning everyone...",
+    "meetingTitle": "Academic Council Review"
   }
-}
-```
+  ```
+- **Processing**:
+  - If `rawTranscriptText` is supplied, generates draft minutes directly from user-reviewed/edited transcript.
+  - If transcript file uploaded: extracts timestamps, dialogue, and sections.
+  - If audio uploaded: transcribes audio locally with Whisper and preserves segment timestamps.
+  - Generates structured draft containing only source-supported content.
+- **Response (Completed)**:
+  ```json
+  {
+    "id": "meeting-job-uuid",
+    "status": "completed",
+    "source": "audio",
+    "transcript": "[00:00 - 00:20]: Good morning everyone...",
+    "audioFileName": "workshop_recording.mp3",
+    "draft": {
+      "title": "Academic Council Review",
+      "summary": "Meeting proceedings recorded from transcript.",
+      "discussions": [
+        {
+          "topic": "Admissions Calendar Review",
+          "points": ["Reviewed proposed timeline for 2026."],
+          "timestamp": "00:01:20"
+        }
+      ],
+      "decisions": [
+        {
+          "decision": "Academic council approved the revised timeline.",
+          "status": "agreed",
+          "evidence": "Identified in transcript"
+        }
+      ],
+      "actionItems": [
+        {
+          "task": "Dr. Sharma will prepare the portal guidelines by next week.",
+          "owner": "Dr. Sharma",
+          "dueDate": "next week",
+          "uncertain": false
+        },
+        {
+          "task": "Someone should check the server bandwidth.",
+          "owner": null,
+          "dueDate": null,
+          "uncertain": true
+        }
+      ],
+      "uncertainties": [
+        "Uncertain owner/deadline for action: 'Someone should check the server bandwidth…'"
+      ]
+    },
+    "limitations": [
+      "Generated draft requires human review. Action owners and deadlines are included only when explicitly stated in source."
+    ]
+  }
+  ```
 
-The service validates and persists the draft in SQLite. Refresh restoration depends on the job ID stored by the frontend and the latest-job endpoint.
+### List Saved ForumNotes Drafts
+`GET /api/meetings/jobs`
 
-## Scope and errors
+- **Purpose**: Retrieve a list of all saved ForumNotes drafts, ordered by last updated date descending.
+- **Response**: Array of `MeetingJobResponse` objects with `createdAt`, `updatedAt`, `draft`, `transcript`, and `source`.
 
-Modules 01 ChangeLens and 03 IndicShield do not have processing endpoints in this backend. API errors use HTTP status codes and a `detail` or job `error` message; do not expose credentials, raw secrets, or private source text in logs or public error pages.
+### Get Meeting Job
+`GET /api/meetings/jobs/:id`
+
+- Returns meeting job status, timestamps, and current draft.
+
+### Download ForumNotes DOCX
+`GET /api/meetings/jobs/:id/download`
+
+- **Purpose**: Export the draft as a formatted institutional `.docx` document containing the latest saved edits (Title, Summary, Discussion Topics, Formal Decisions Table, Action Items Table with Owners & Deadlines, and Uncertainties).
+- **Response**: Binary `.docx` stream with `Content-Disposition: attachment; filename="<title>.docx"`.
+
+### Update Meeting Draft
+`PUT /api/meetings/jobs/:id/draft`
+
+- **Request**:
+  ```json
+  {
+    "draft": { "...": "updated draft object" }
+  }
+  ```
+- **Response**: Updated `MeetingJobResponse`.

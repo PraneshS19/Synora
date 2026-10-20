@@ -8,10 +8,14 @@ import {
   createTranslationJob,
   getTranslationJob,
   updateTranslationSegment,
+  downloadTranslatedDocument,
   createMeetingJob,
   getMeetingJob,
   getLatestMeetingJob,
   updateMeetingDraft,
+  transcribeMeetingAudio,
+  listMeetingJobs,
+  downloadMeetingDocx,
   type Collection,
   type QuestionResponse,
   type TranslationJob,
@@ -345,8 +349,30 @@ function TranslateWorkspace() {
   const [sourceText, setSourceText] = useState('')
   const [job, setJob] = useState<TranslationJob | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [isDownloading, setIsDownloading] = useState(false)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const handleDownload = async () => {
+    if (!job) return
+    setIsDownloading(true)
+    setError(null)
+    try {
+      const { blob, filename } = await downloadTranslatedDocument(job.id)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err: any) {
+      setError(`Download failed: ${err.message}`)
+    } finally {
+      setIsDownloading(false)
+    }
+  }
 
   const handleTranslate = async () => {
     if (!translateFiles.length && !sourceText.trim()) {
@@ -503,10 +529,21 @@ function TranslateWorkspace() {
                   ? '✎ Edited'
                   : 'Review required'
 
+                const blockLabel = seg.blockType === 'heading'
+                  ? `Heading ${seg.blockLevel || 1}`
+                  : seg.blockType === 'bullet'
+                  ? 'Bullet item'
+                  : seg.blockType === 'table_cell'
+                  ? `Table ${((seg.tableIndex ?? 0) + 1)} · Cell [R${((seg.rowIndex ?? 0) + 1)}, C${((seg.cellIndex ?? 0) + 1)}]`
+                  : null
+
                 return (
                   <div key={seg.id} className="segment-card">
                     <div className="segment-source">
-                      <small style={{ display: 'block', marginBottom: '4px', color: 'var(--muted)' }}>Source ({job.sourceLanguage})</small>
+                      <small style={{ display: 'block', marginBottom: '4px', color: 'var(--muted)' }}>
+                        Source ({job.sourceLanguage})
+                        {blockLabel && <span style={{ marginLeft: '6px', opacity: 0.85, fontWeight: 500 }}>· {blockLabel}</span>}
+                      </small>
                       {seg.source}
                     </div>
                     <div className="segment-target">
@@ -550,6 +587,22 @@ function TranslateWorkspace() {
           </div>
         )}
       </section>
+
+      {job && job.status === 'completed' && job.segments.length > 0 && (
+        <section className="download-section" style={{ marginTop: '24px', paddingTop: '16px', borderTop: '1px solid var(--border)' }}>
+          <b>Download translated document</b>
+          <p style={{ color: 'var(--sub)', fontSize: '13px', marginBottom: '12px' }}>
+            The downloaded file will contain your latest edits. For PDF inputs, download produces a DOCX file (PDF visual layout cannot be reproduced from translated text).
+          </p>
+          <button
+            className="button secondary"
+            disabled={isDownloading}
+            onClick={handleDownload}
+          >
+            {isDownloading ? 'Preparing download…' : '⬇ Download translated document'}
+          </button>
+        </section>
+      )}
     </div>
   )
 }
@@ -558,19 +611,40 @@ function MeetingWorkspace() {
   const [audioFiles, setAudioFiles] = useState<LocalFile[]>([])
   const [transcriptFiles, setTranscriptFiles] = useState<LocalFile[]>([])
   const [meetingTitle, setMeetingTitle] = useState('Institutional Meeting')
+  const [transcriptText, setTranscriptText] = useState('')
   const [job, setJob] = useState<MeetingJob | null>(null)
   const [draft, setDraft] = useState<MeetingDraft | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [isTranscribing, setIsTranscribing] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saveMessage, setSaveMessage] = useState<string | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
 
+  // Saved drafts state & tabs
+  const [activeTab, setActiveTab] = useState<'editor' | 'saved'>('editor')
+  const [savedDrafts, setSavedDrafts] = useState<MeetingJob[]>([])
+  const [isLoadingSaved, setIsLoadingSaved] = useState(false)
+  const [isDownloading, setIsDownloading] = useState<string | null>(null)
+
+  const refreshSavedDrafts = async () => {
+    try {
+      setIsLoadingSaved(true)
+      const list = await listMeetingJobs()
+      setSavedDrafts(list)
+    } catch {
+      // Graceful fallback
+    } finally {
+      setIsLoadingSaved(false)
+    }
+  }
+
   // Restore latest draft or active job on component mount / browser refresh
   useEffect(() => {
     let isMounted = true
     const restoreActiveJob = async () => {
+      refreshSavedDrafts()
       const activeJobId = localStorage.getItem('synora_active_meeting_job_id')
       let loadedJob: MeetingJob | null = null
 
@@ -590,10 +664,15 @@ function MeetingWorkspace() {
         }
       }
 
-      if (isMounted && loadedJob && loadedJob.draft) {
+      if (isMounted && loadedJob) {
         setJob(loadedJob)
-        setDraft(loadedJob.draft)
-        setMeetingTitle(loadedJob.draft.title || 'Institutional Meeting')
+        if (loadedJob.draft) {
+          setDraft(loadedJob.draft)
+          setMeetingTitle(loadedJob.draft.title || 'Institutional Meeting')
+        }
+        if (loadedJob.transcript) {
+          setTranscriptText(loadedJob.transcript)
+        }
       }
     }
 
@@ -601,9 +680,40 @@ function MeetingWorkspace() {
     return () => { isMounted = false }
   }, [])
 
+  const handleTranscribeAudio = async () => {
+    if (!audioFiles.length) {
+      setError('Please upload an audio recording (.mp3, .wav, or .m4a) to transcribe.')
+      return
+    }
+
+    setError(null)
+    setSaveMessage(null)
+    setSaveError(null)
+    setIsTranscribing(true)
+    setStatusMessage('Uploading audio recording for transcription...')
+
+    try {
+      const audioUp = await uploadFiles([audioFiles[0].file], 'meeting')
+      if (!audioUp.length) throw new Error('Audio file upload failed.')
+
+      setStatusMessage('Transcribing audio locally with OpenAI Whisper (timestamps preserved)...')
+      const res = await transcribeMeetingAudio(audioUp[0].id)
+      setTranscriptText(res.transcript)
+      setStatusMessage(null)
+      setSaveMessage(`Audio recording successfully transcribed (${res.audioFileName}). You can review and edit below, then generate draft minutes.`)
+      setTimeout(() => setSaveMessage(null), 6000)
+    } catch (err: any) {
+      setError(err.message || 'Audio transcription failed.')
+      setStatusMessage(null)
+    } finally {
+      setIsTranscribing(false)
+    }
+  }
+
   const handleGenerate = async () => {
-    if (!audioFiles.length && !transcriptFiles.length) {
-      setError('Please upload at least one audio recording or transcript file.')
+    const hasText = Boolean(transcriptText.trim())
+    if (!audioFiles.length && !transcriptFiles.length && !hasText) {
+      setError('Please upload an audio recording, upload a transcript file, or enter transcript text.')
       return
     }
 
@@ -611,43 +721,65 @@ function MeetingWorkspace() {
     setSaveMessage(null)
     setSaveError(null)
     setIsLoading(true)
-    setStatusMessage('Uploading meeting source files...')
 
     try {
       let audioFileIds: string[] = []
       let transcriptFileIds: string[] = []
 
-      if (audioFiles.length) {
-        const audioUp = await uploadFiles(audioFiles.map((f) => f.file), 'meeting')
-        audioFileIds = audioUp.map((u) => u.id)
-      }
-      if (transcriptFiles.length) {
-        const transUp = await uploadFiles(transcriptFiles.map((f) => f.file), 'meeting')
-        transcriptFileIds = transUp.map((u) => u.id)
-      }
+      // If user has edited or entered transcript text, use that directly
+      if (hasText) {
+        setStatusMessage('Reconciling evidence and drafting minutes from edited transcript...')
+        const res = await createMeetingJob({
+          rawTranscriptText: transcriptText.trim(),
+          meetingTitle: meetingTitle || undefined,
+        })
 
-      setStatusMessage('Extracting proceedings, reconciling evidence, and drafting minutes...')
-      const res = await createMeetingJob({
-        audioFileIds,
-        transcriptFileIds,
-        meetingTitle: meetingTitle || undefined,
-      })
-
-      if (res.status === 'failed') {
-        setError(res.error || 'Meeting minutes generation failed.')
-        setJob(null)
-        setDraft(null)
-      } else {
-        setJob(res)
-        setDraft(res.draft || null)
-        if (res.draft?.title) {
-          setMeetingTitle(res.draft.title)
+        if (res.status === 'failed') {
+          setError(res.error || 'ForumNotes generation failed.')
+          setJob(null)
+          setDraft(null)
+        } else {
+          setJob(res)
+          setDraft(res.draft || null)
+          if (res.transcript) setTranscriptText(res.transcript)
+          if (res.draft?.title) setMeetingTitle(res.draft.title)
+          localStorage.setItem('synora_active_meeting_job_id', res.id)
+          refreshSavedDrafts()
         }
-        localStorage.setItem('synora_active_meeting_job_id', res.id)
+      } else {
+        setStatusMessage('Uploading meeting source files...')
+        if (audioFiles.length) {
+          const audioUp = await uploadFiles(audioFiles.map((f) => f.file), 'meeting')
+          audioFileIds = audioUp.map((u) => u.id)
+        }
+        if (transcriptFiles.length) {
+          const transUp = await uploadFiles(transcriptFiles.map((f) => f.file), 'meeting')
+          transcriptFileIds = transUp.map((u) => u.id)
+        }
+
+        setStatusMessage('Extracting proceedings, reconciling evidence, and drafting minutes...')
+        const res = await createMeetingJob({
+          audioFileIds,
+          transcriptFileIds,
+          meetingTitle: meetingTitle || undefined,
+        })
+
+        if (res.status === 'failed') {
+          setError(res.error || 'ForumNotes generation failed.')
+          setJob(null)
+          setDraft(null)
+        } else {
+          setJob(res)
+          setDraft(res.draft || null)
+          if (res.transcript) setTranscriptText(res.transcript)
+          if (res.draft?.title) setMeetingTitle(res.draft.title)
+          localStorage.setItem('synora_active_meeting_job_id', res.id)
+          refreshSavedDrafts()
+        }
       }
       setStatusMessage(null)
     } catch (err: any) {
-      setError(err.message || 'An error occurred during meeting minutes generation.')
+      setError(err.message || 'An error occurred during ForumNotes generation.')
       setStatusMessage(null)
     } finally {
       setIsLoading(false)
@@ -678,6 +810,7 @@ function MeetingWorkspace() {
       localStorage.setItem('synora_active_meeting_job_id', job.id)
       setSaveMessage(`Draft edits successfully saved (Title: "${currentTitle}").`)
       setTimeout(() => setSaveMessage(null), 5000)
+      refreshSavedDrafts()
     } catch (err: any) {
       setSaveError(`Failed to save draft edits: ${err.message}`)
     } finally {
@@ -685,267 +818,555 @@ function MeetingWorkspace() {
     }
   }
 
+  const handleDownloadCurrentDocx = async () => {
+    if (!job || !draft) return
+    setError(null)
+    setIsDownloading('current')
+    try {
+      // Save latest draft edits first so DOCX uses latest edits
+      const currentTitle = draft.title?.trim() || meetingTitle.trim() || 'Institutional Meeting'
+      const draftToSave: MeetingDraft = { ...draft, title: currentTitle }
+      const updatedJob = await updateMeetingDraft(job.id, draftToSave)
+      setJob(updatedJob)
+      if (updatedJob.draft) {
+        setDraft(updatedJob.draft)
+        setMeetingTitle(updatedJob.draft.title)
+      }
+
+      const { blob, filename } = await downloadMeetingDocx(job.id)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      setSaveMessage(`Downloaded "${filename}" with latest saved edits.`)
+      setTimeout(() => setSaveMessage(null), 5000)
+      refreshSavedDrafts()
+    } catch (err: any) {
+      setError(err.message || 'Failed to download DOCX.')
+    } finally {
+      setIsDownloading(null)
+    }
+  }
+
+  const handleDownloadSavedDocx = async (savedJobId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation()
+    setIsDownloading(savedJobId)
+    try {
+      const { blob, filename } = await downloadMeetingDocx(savedJobId)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err: any) {
+      setError(err.message || 'Failed to download DOCX.')
+    } finally {
+      setIsDownloading(null)
+    }
+  }
+
+  const handleReopenDraft = (savedJob: MeetingJob) => {
+    setJob(savedJob)
+    if (savedJob.draft) {
+      setDraft(savedJob.draft)
+      setMeetingTitle(savedJob.draft.title || 'Institutional Meeting')
+    } else {
+      setDraft(null)
+    }
+    if (savedJob.transcript) {
+      setTranscriptText(savedJob.transcript)
+    }
+    localStorage.setItem('synora_active_meeting_job_id', savedJob.id)
+    setActiveTab('editor')
+    setSaveMessage(`Reopened draft: "${savedJob.draft?.title || 'Saved Draft'}"`)
+    setTimeout(() => setSaveMessage(null), 4000)
+  }
+
   return (
     <div className="workspace-flow meeting-flow">
-      <label className="field">
-        Meeting Title
-        <input
-          value={draft ? draft.title : meetingTitle}
-          onChange={(e) => {
-            const val = e.target.value
-            setMeetingTitle(val)
-            if (draft) {
-              setDraft({ ...draft, title: val })
-            }
+      {/* Navigation tabs */}
+      <div style={{ display: 'flex', gap: '8px', borderBottom: '1px solid var(--border)', paddingBottom: '12px', marginBottom: '16px' }}>
+        <button
+          type="button"
+          className={`button ${activeTab === 'editor' ? 'primary' : 'secondary'}`}
+          onClick={() => setActiveTab('editor')}
+        >
+          Draft Editor
+        </button>
+        <button
+          type="button"
+          className={`button ${activeTab === 'saved' ? 'primary' : 'secondary'}`}
+          onClick={() => {
+            setActiveTab('saved')
+            refreshSavedDrafts()
           }}
-          placeholder="e.g. Academic Council Annual Meeting"
-        />
-      </label>
+        >
+          Saved Drafts ({savedDrafts.length})
+        </button>
+      </div>
 
-      <FileQueue
-        title="Upload audio recording"
-        accept={['.mp3', '.wav', '.m4a']}
-        files={audioFiles}
-        onChange={(files) => {
-          setAudioFiles(files)
-          setJob(null)
-        }}
-        hint="MP3, WAV, or M4A · up to 200 MB each"
-        maxMb={200}
-      />
-      <FileQueue
-        title="Upload transcript"
-        accept={['.txt', '.docx', '.pdf', '.vtt', '.srt']}
-        files={transcriptFiles}
-        onChange={(files) => {
-          setTranscriptFiles(files)
-          setJob(null)
-        }}
-        hint="TXT, DOCX, PDF, VTT, or SRT · up to 20 MB each"
-      />
-      <p className="integration-state">
-        {draft
-          ? 'Meeting minutes generated. Review decisions and verify flagged action item owners and deadlines.'
-          : 'Use audio, a transcript, or both. Transcription and reconciliation require a configured secure service; no draft minutes will be fabricated.'}
-      </p>
-      {error && <div className="status-banner error" role="alert">{error}</div>}
-      {statusMessage && (
-        <div className="status-indicator">
-          <div className="spinner" />
-          <span>{statusMessage}</span>
-        </div>
-      )}
-      <button
-        className="button primary"
-        disabled={(!audioFiles.length && !transcriptFiles.length) || isLoading}
-        onClick={handleGenerate}
-      >
-        {isLoading ? 'Generating…' : 'Generate draft minutes'}
-      </button>
-
-      <section className="minutes-draft">
-        <b>Reviewable minutes draft</b>
-        {!draft && !isLoading && (
-          <p>A generated draft will remain editable and will identify uncertain decisions, owners, and deadlines for review.</p>
-        )}
-        {draft && (
-          <div className="draft-container">
-            <div className="status-banner warning">
-              {job?.limitations?.[0] || 'Generated draft requires human review. Action owners and deadlines are included only when explicitly stated in source.'}
+      {activeTab === 'saved' ? (
+        <div className="saved-drafts-panel" style={{ display: 'grid', gap: '16px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+            <div>
+              <h2 style={{ fontSize: '18px', margin: 0 }}>Saved ForumNotes Drafts</h2>
+              <p style={{ color: 'var(--muted)', fontSize: '13px', margin: '4px 0 0 0' }}>
+                Browse saved drafts, reopen any draft to continue editing, or download the latest formatted DOCX.
+              </p>
             </div>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={isLoadingSaved}
+              onClick={refreshSavedDrafts}
+              style={{ fontSize: '12px', padding: '6px 12px' }}
+            >
+              {isLoadingSaved ? 'Refreshing…' : '↻ Refresh list'}
+            </button>
+          </div>
 
-            <div className="draft-card">
-              <h3>Draft Title & Summary</h3>
-              <input
-                className="field"
-                style={{ marginBottom: '12px', fontWeight: 600 }}
-                value={draft.title}
-                onChange={(e) => setDraft({ ...draft, title: e.target.value })}
-              />
-              <textarea
-                className="field"
-                style={{ minHeight: '90px' }}
-                value={draft.summary}
-                onChange={(e) => setDraft({ ...draft, summary: e.target.value })}
-              />
+          {savedDrafts.length === 0 ? (
+            <div className="draft-card" style={{ textAlign: 'center', padding: '36px 20px', color: 'var(--muted)' }}>
+              <p style={{ margin: 0, fontSize: '14px' }}>No saved ForumNotes drafts found.</p>
+              <p style={{ margin: '8px 0 16px 0', fontSize: '12px' }}>
+                Upload an audio recording or transcript in the Draft Editor, generate minutes, and save your edits to see them listed here.
+              </p>
+              <button
+                type="button"
+                className="button primary"
+                onClick={() => setActiveTab('editor')}
+              >
+                Go to Draft Editor
+              </button>
             </div>
+          ) : (
+            <div style={{ display: 'grid', gap: '12px' }}>
+              {savedDrafts.map((item) => {
+                const itemTitle = item.draft?.title || 'Untitled Meeting Record'
+                const dateStr = item.updatedAt || item.createdAt
+                const formattedDate = dateStr
+                  ? new Date(dateStr).toLocaleString('en-US', {
+                      year: 'numeric',
+                      month: 'short',
+                      day: 'numeric',
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })
+                  : 'Date recorded'
 
-            <div className="draft-card">
-              <h3>Discussion Topics ({draft.discussions.length})</h3>
-              {draft.discussions.length === 0 ? (
-                <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
-                  No explicit discussion topics identified in the transcript.
-                </p>
-              ) : (
-                draft.discussions.map((d, i) => (
-                  <div key={i} className="draft-item" style={{ marginBottom: '10px' }}>
-                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
-                      <input
-                        className="field"
-                        style={{ fontWeight: 600, fontSize: '13px', marginBottom: 0, padding: '4px 8px', flex: 1 }}
-                        value={d.topic}
-                        onChange={(e) => {
-                          const next = [...draft.discussions]
-                          next[i] = { ...d, topic: e.target.value }
-                          setDraft({ ...draft, discussions: next })
-                        }}
-                      />
-                      {d.timestamp && <span className="citation-badge">{d.timestamp}</span>}
+                const topicsCount = item.draft?.discussions?.length ?? 0
+                const decsCount = item.draft?.decisions?.length ?? 0
+                const actsCount = item.draft?.actionItems?.length ?? 0
+
+                return (
+                  <div
+                    key={item.id}
+                    className="draft-card"
+                    style={{
+                      display: 'grid',
+                      gap: '10px',
+                      borderLeft: job?.id === item.id ? '3px solid var(--accent, #6366f1)' : undefined,
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px', flexWrap: 'wrap' }}>
+                      <div style={{ flex: 1, minWidth: '220px' }}>
+                        <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 600 }}>{itemTitle}</h3>
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginTop: '6px' }}>
+                          <span style={{ fontSize: '12px', color: 'var(--muted)' }}>
+                            📅 {formattedDate}
+                          </span>
+                          <span className="citation-badge" style={{ fontSize: '11px' }}>
+                            {item.source === 'audio' ? `🎙 ${item.audioFileName || 'Audio'}` : '📄 Transcript'}
+                          </span>
+                          {job?.id === item.id && (
+                            <span className="draft-badge" style={{ fontSize: '11px', background: '#312e81', color: '#c7d2fe' }}>
+                              Active in Editor
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                        <button
+                          type="button"
+                          className="button secondary"
+                          disabled={isDownloading === item.id}
+                          onClick={(e) => handleDownloadSavedDocx(item.id, e)}
+                          style={{ fontSize: '12px', padding: '6px 12px' }}
+                        >
+                          {isDownloading === item.id ? 'Downloading…' : '⬇ Download DOCX'}
+                        </button>
+                        <button
+                          type="button"
+                          className="button primary"
+                          onClick={() => handleReopenDraft(item)}
+                          style={{ fontSize: '12px', padding: '6px 12px' }}
+                        >
+                          Reopen & Edit
+                        </button>
+                      </div>
                     </div>
-                    <div style={{ display: 'grid', gap: '4px', paddingLeft: '12px' }}>
-                      {d.points.map((pt, j) => (
-                        <textarea
-                          key={j}
+
+                    {item.draft?.summary && (
+                      <p style={{ margin: 0, fontSize: '13px', color: 'var(--sub)', lineHeight: '1.4' }}>
+                        {item.draft.summary.length > 200 ? `${item.draft.summary.slice(0, 200)}…` : item.draft.summary}
+                      </p>
+                    )}
+
+                    <div style={{ display: 'flex', gap: '14px', fontSize: '12px', color: 'var(--muted)', borderTop: '1px solid var(--border)', paddingTop: '8px', flexWrap: 'wrap' }}>
+                      <span><b>{topicsCount}</b> discussion topics</span>
+                      <span>•</span>
+                      <span><b>{decsCount}</b> decisions</span>
+                      <span>•</span>
+                      <span><b>{actsCount}</b> action items</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      ) : (
+        <>
+          <label className="field">
+            Meeting Title
+            <input
+              value={draft ? draft.title : meetingTitle}
+              onChange={(e) => {
+                const val = e.target.value
+                setMeetingTitle(val)
+                if (draft) {
+                  setDraft({ ...draft, title: val })
+                }
+              }}
+              placeholder="e.g. Academic Council Annual Meeting"
+            />
+          </label>
+
+          <FileQueue
+            title="Upload audio recording"
+            accept={['.mp3', '.wav', '.m4a']}
+            files={audioFiles}
+            onChange={(files) => {
+              setAudioFiles(files)
+              setJob(null)
+            }}
+            hint="MP3, WAV, or M4A · up to 200 MB each"
+            maxMb={200}
+          />
+          <FileQueue
+            title="Upload transcript"
+            accept={['.txt', '.docx', '.pdf', '.vtt', '.srt']}
+            files={transcriptFiles}
+            onChange={(files) => {
+              setTranscriptFiles(files)
+              setJob(null)
+            }}
+            hint="TXT, DOCX, PDF, VTT, or SRT · up to 20 MB each"
+          />
+          <p className="integration-state">
+            {draft
+              ? 'ForumNotes generated. Review decisions and verify flagged action item owners and deadlines.'
+              : 'Use audio, a transcript, or both. Transcribe audio locally with Whisper, inspect and edit proceedings, and generate verifiable draft minutes.'}
+          </p>
+          {error && <div className="status-banner error" role="alert">{error}</div>}
+          {statusMessage && (
+            <div className="status-indicator">
+              <div className="spinner" />
+              <span>{statusMessage}</span>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '4px' }}>
+            {audioFiles.length > 0 && (
+              <button
+                type="button"
+                className="button secondary"
+                disabled={isTranscribing || isLoading}
+                onClick={handleTranscribeAudio}
+              >
+                {isTranscribing ? 'Transcribing audio…' : 'Transcribe audio recording'}
+              </button>
+            )}
+            <button
+              type="button"
+              className="button primary"
+              disabled={(!audioFiles.length && !transcriptFiles.length && !transcriptText.trim()) || isLoading || isTranscribing}
+              onClick={handleGenerate}
+            >
+              {isLoading ? 'Generating draft minutes…' : 'Generate draft minutes'}
+            </button>
+          </div>
+
+          <div className="draft-card" style={{ marginTop: '20px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <h3 style={{ margin: 0 }}>Meeting Transcript (Review & Edit)</h3>
+              {transcriptText && (
+                <span style={{ fontSize: '12px', color: 'var(--muted)' }}>
+                  {transcriptText.split('\n').filter(Boolean).length} segments · {transcriptText.length} characters
+                </span>
+              )}
+            </div>
+            <p style={{ fontSize: '13px', color: 'var(--muted)', marginTop: 0, marginBottom: '8px' }}>
+              Transcribed speech with segment timestamps [MM:SS] appears here. You can review, correct terms or speaker names, and generate or regenerate minutes from your edits.
+            </p>
+            <textarea
+              className="field"
+              style={{ minHeight: '140px', fontFamily: 'monospace', fontSize: '13px', lineHeight: '1.5', width: '100%', boxSizing: 'border-box' }}
+              value={transcriptText}
+              onChange={(e) => setTranscriptText(e.target.value)}
+              placeholder="Transcribed audio or extracted transcript text will appear here with segment timestamps [MM:SS]. You can also paste or type dialogue directly here..."
+              disabled={isTranscribing || isLoading}
+            />
+            {transcriptText.trim() && (
+              <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+                <button
+                  type="button"
+                  className="button primary"
+                  disabled={isLoading || isTranscribing}
+                  onClick={handleGenerate}
+                >
+                  {isLoading ? 'Regenerating minutes…' : 'Regenerate minutes from edited transcript'}
+                </button>
+              </div>
+            )}
+          </div>
+
+          <section className="minutes-draft">
+            <b>Reviewable minutes draft</b>
+            {!draft && !isLoading && (
+              <p>A generated draft will remain editable and will identify uncertain decisions, owners, and deadlines for review.</p>
+            )}
+            {draft && (
+              <div className="draft-container">
+                <div className="status-banner warning">
+                  {job?.limitations?.[0] || 'Generated draft requires human review. Action owners and deadlines are included only when explicitly stated in source.'}
+                </div>
+
+                <div className="draft-card">
+                  <h3>Draft Title & Summary</h3>
+                  <input
+                    className="field"
+                    style={{ marginBottom: '12px', fontWeight: 600 }}
+                    value={draft.title}
+                    onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+                  />
+                  <textarea
+                    className="field"
+                    style={{ minHeight: '90px' }}
+                    value={draft.summary}
+                    onChange={(e) => setDraft({ ...draft, summary: e.target.value })}
+                  />
+                </div>
+
+                <div className="draft-card">
+                  <h3>Discussion Topics ({draft.discussions.length})</h3>
+                  {draft.discussions.length === 0 ? (
+                    <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
+                      No explicit discussion topics identified in the transcript.
+                    </p>
+                  ) : (
+                    draft.discussions.map((d, i) => (
+                      <div key={i} className="draft-item" style={{ marginBottom: '10px' }}>
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                          <input
+                            className="field"
+                            style={{ fontWeight: 600, fontSize: '13px', marginBottom: 0, padding: '4px 8px', flex: 1 }}
+                            value={d.topic}
+                            onChange={(e) => {
+                              const next = [...draft.discussions]
+                              next[i] = { ...d, topic: e.target.value }
+                              setDraft({ ...draft, discussions: next })
+                            }}
+                          />
+                          {d.timestamp && <span className="citation-badge">{d.timestamp}</span>}
+                        </div>
+                        <div style={{ display: 'grid', gap: '4px', paddingLeft: '12px' }}>
+                          {d.points.map((pt, j) => (
+                            <textarea
+                              key={j}
+                              className="field"
+                              style={{ minHeight: '36px', fontSize: '12px', margin: 0, padding: '4px 8px', color: 'var(--sub)' }}
+                              value={pt}
+                              onChange={(e) => {
+                                const next = [...draft.discussions]
+                                const nextPts = [...d.points]
+                                nextPts[j] = e.target.value
+                                next[i] = { ...d, points: nextPts }
+                                setDraft({ ...draft, discussions: next })
+                              }}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <div className="draft-card">
+                  <h3>Formal Decisions ({draft.decisions.length})</h3>
+                  {draft.decisions.length === 0 ? (
+                    <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
+                      No formal resolutions or voting outcomes were explicitly finalized in the recorded segment.
+                    </p>
+                  ) : (
+                    draft.decisions.map((dec, i) => (
+                      <div key={i} className="draft-item" style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center' }}>
+                        <input
                           className="field"
-                          style={{ minHeight: '36px', fontSize: '12px', margin: 0, padding: '4px 8px', color: 'var(--sub)' }}
-                          value={pt}
+                          style={{ fontSize: '13px', padding: '6px 8px', marginBottom: 0 }}
+                          value={dec.decision}
                           onChange={(e) => {
-                            const next = [...draft.discussions]
-                            const nextPts = [...d.points]
-                            nextPts[j] = e.target.value
-                            next[i] = { ...d, points: nextPts }
-                            setDraft({ ...draft, discussions: next })
+                            const next = [...draft.decisions]
+                            next[i] = { ...dec, decision: e.target.value }
+                            setDraft({ ...draft, decisions: next })
+                          }}
+                        />
+                        <select
+                          style={{ fontSize: '12px', padding: '6px 8px', borderRadius: '4px', border: '1px solid var(--border)', background: 'var(--bg)' }}
+                          value={dec.status}
+                          onChange={(e) => {
+                            const next = [...draft.decisions]
+                            next[i] = { ...dec, status: e.target.value as 'agreed' | 'pending' }
+                            setDraft({ ...draft, decisions: next })
+                          }}
+                        >
+                          <option value="agreed">agreed</option>
+                          <option value="pending">pending</option>
+                        </select>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <div className="draft-card">
+                  <h3>Action Items ({draft.actionItems.length})</h3>
+                  {draft.actionItems.length === 0 ? (
+                    <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
+                      No explicit action assignments or task commitments were identified in the source.
+                    </p>
+                  ) : (
+                    draft.actionItems.map((act, i) => (
+                      <div key={i} className="draft-item" style={{ display: 'grid', gap: '8px' }}>
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                          <input
+                            className="field"
+                            style={{ flex: 1, fontSize: '13px', padding: '6px 8px', marginBottom: 0 }}
+                            value={act.task}
+                            onChange={(e) => {
+                              const next = [...draft.actionItems]
+                              next[i] = { ...act, task: e.target.value }
+                              setDraft({ ...draft, actionItems: next })
+                            }}
+                          />
+                          {act.uncertain && <span className="draft-badge uncertain">Uncertain</span>}
+                        </div>
+                        <div className="two-up" style={{ marginBottom: 0 }}>
+                          <input
+                            style={{ fontSize: '12px', padding: '6px 8px' }}
+                            placeholder="Owner (optional)"
+                            value={act.owner || ''}
+                            onChange={(e) => {
+                              const next = [...draft.actionItems]
+                              next[i] = { ...act, owner: e.target.value || null, uncertain: !e.target.value || !act.dueDate }
+                              setDraft({ ...draft, actionItems: next })
+                            }}
+                          />
+                          <input
+                            style={{ fontSize: '12px', padding: '6px 8px' }}
+                            placeholder="Due Date (optional)"
+                            value={act.dueDate || ''}
+                            onChange={(e) => {
+                              const next = [...draft.actionItems]
+                              next[i] = { ...act, dueDate: e.target.value || null, uncertain: !act.owner || !e.target.value }
+                              setDraft({ ...draft, actionItems: next })
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {draft.uncertainties.length > 0 && (
+                  <div className="uncertainty-box">
+                    <b style={{ display: 'block', marginBottom: '6px' }}>Identified Source Uncertainties</b>
+                    <div style={{ display: 'grid', gap: '4px' }}>
+                      {draft.uncertainties.map((u, i) => (
+                        <input
+                          key={i}
+                          className="field"
+                          style={{ fontSize: '12px', padding: '4px 8px', marginBottom: 0 }}
+                          value={u}
+                          onChange={(e) => {
+                            const next = [...draft.uncertainties]
+                            next[i] = e.target.value
+                            setDraft({ ...draft, uncertainties: next })
                           }}
                         />
                       ))}
                     </div>
                   </div>
-                ))
-              )}
-            </div>
+                )}
 
-            <div className="draft-card">
-              <h3>Formal Decisions ({draft.decisions.length})</h3>
-              {draft.decisions.length === 0 ? (
-                <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
-                  No formal resolutions or voting outcomes were explicitly finalized in the recorded segment.
-                </p>
-              ) : (
-                draft.decisions.map((dec, i) => (
-                  <div key={i} className="draft-item" style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center' }}>
-                    <input
-                      className="field"
-                      style={{ fontSize: '13px', padding: '6px 8px', marginBottom: 0 }}
-                      value={dec.decision}
-                      onChange={(e) => {
-                        const next = [...draft.decisions]
-                        next[i] = { ...dec, decision: e.target.value }
-                        setDraft({ ...draft, decisions: next })
-                      }}
-                    />
-                    <select
-                      style={{ fontSize: '12px', padding: '6px 8px', borderRadius: '4px', border: '1px solid var(--border)', background: 'var(--bg)' }}
-                      value={dec.status}
-                      onChange={(e) => {
-                        const next = [...draft.decisions]
-                        next[i] = { ...dec, status: e.target.value as 'agreed' | 'pending' }
-                        setDraft({ ...draft, decisions: next })
-                      }}
-                    >
-                      <option value="agreed">agreed</option>
-                      <option value="pending">pending</option>
-                    </select>
-                  </div>
-                ))
-              )}
-            </div>
-
-            <div className="draft-card">
-              <h3>Action Items ({draft.actionItems.length})</h3>
-              {draft.actionItems.length === 0 ? (
-                <p style={{ color: 'var(--muted)', fontSize: '13px' }}>
-                  No explicit action assignments or task commitments were identified in the source.
-                </p>
-              ) : (
-                draft.actionItems.map((act, i) => (
-                  <div key={i} className="draft-item" style={{ display: 'grid', gap: '8px' }}>
-                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                      <input
-                        className="field"
-                        style={{ flex: 1, fontSize: '13px', padding: '6px 8px', marginBottom: 0 }}
-                        value={act.task}
-                        onChange={(e) => {
-                          const next = [...draft.actionItems]
-                          next[i] = { ...act, task: e.target.value }
-                          setDraft({ ...draft, actionItems: next })
-                        }}
-                      />
-                      {act.uncertain && <span className="draft-badge uncertain">Uncertain</span>}
+                <div style={{ marginTop: '16px', display: 'grid', gap: '8px' }}>
+                  {saveMessage && (
+                    <div className="status-banner success" role="status" style={{ margin: 0 }}>
+                      ✓ {saveMessage}
                     </div>
-                    <div className="two-up" style={{ marginBottom: 0 }}>
-                      <input
-                        style={{ fontSize: '12px', padding: '6px 8px' }}
-                        placeholder="Owner (optional)"
-                        value={act.owner || ''}
-                        onChange={(e) => {
-                          const next = [...draft.actionItems]
-                          next[i] = { ...act, owner: e.target.value || null, uncertain: !e.target.value || !act.dueDate }
-                          setDraft({ ...draft, actionItems: next })
-                        }}
-                      />
-                      <input
-                        style={{ fontSize: '12px', padding: '6px 8px' }}
-                        placeholder="Due Date (optional)"
-                        value={act.dueDate || ''}
-                        onChange={(e) => {
-                          const next = [...draft.actionItems]
-                          next[i] = { ...act, dueDate: e.target.value || null, uncertain: !act.owner || !e.target.value }
-                          setDraft({ ...draft, actionItems: next })
-                        }}
-                      />
+                  )}
+                  {saveError && (
+                    <div className="status-banner error" role="alert" style={{ margin: 0 }}>
+                      ⚠ {saveError}
                     </div>
+                  )}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="button primary"
+                        disabled={isSaving || isDownloading === 'current'}
+                        onClick={handleSaveDraft}
+                      >
+                        {isSaving ? 'Saving edits…' : 'Save draft edits'}
+                      </button>
+                      <button
+                        type="button"
+                        className="button secondary"
+                        disabled={isSaving || isDownloading === 'current'}
+                        onClick={handleDownloadCurrentDocx}
+                      >
+                        {isDownloading === 'current' ? 'Generating DOCX…' : '⬇ Download formatted DOCX'}
+                      </button>
+                    </div>
+                    {savedDrafts.length > 0 && (
+                      <button
+                        type="button"
+                        className="button secondary"
+                        onClick={() => {
+                          setActiveTab('saved')
+                          refreshSavedDrafts()
+                        }}
+                        style={{ fontSize: '12px' }}
+                      >
+                        Browse all saved drafts ({savedDrafts.length}) →
+                      </button>
+                    )}
                   </div>
-                ))
-              )}
-            </div>
-
-            {draft.uncertainties.length > 0 && (
-              <div className="uncertainty-box">
-                <b style={{ display: 'block', marginBottom: '6px' }}>Identified Source Uncertainties</b>
-                <div style={{ display: 'grid', gap: '4px' }}>
-                  {draft.uncertainties.map((u, i) => (
-                    <input
-                      key={i}
-                      className="field"
-                      style={{ fontSize: '12px', padding: '4px 8px', marginBottom: 0 }}
-                      value={u}
-                      onChange={(e) => {
-                        const next = [...draft.uncertainties]
-                        next[i] = e.target.value
-                        setDraft({ ...draft, uncertainties: next })
-                      }}
-                    />
-                  ))}
                 </div>
+
               </div>
             )}
-
-            <div style={{ marginTop: '16px', display: 'grid', gap: '8px' }}>
-              {saveMessage && (
-                <div className="status-banner success" role="status" style={{ margin: 0 }}>
-                  ✓ {saveMessage}
-                </div>
-              )}
-              {saveError && (
-                <div className="status-banner error" role="alert" style={{ margin: 0 }}>
-                  ⚠ {saveError}
-                </div>
-              )}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <button
-                  type="button"
-                  className="button primary"
-                  disabled={isSaving}
-                  onClick={handleSaveDraft}
-                >
-                  {isSaving ? 'Saving edits…' : 'Save draft edits'}
-                </button>
-              </div>
-            </div>
-
-          </div>
-        )}
-      </section>
+          </section>
+        </>
+      )}
     </div>
   )
 }

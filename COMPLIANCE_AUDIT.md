@@ -1,61 +1,76 @@
-# SYNORA local demo — scope and compliance notes
+# SYNORA preliminary frontend compliance audit
 
-**Status date:** 2026-10-20
-**Scope:** frontend and local FastAPI workflows for Institutional RAG (02), IndicTranslate (04), and Meeting Minutes (05).
+Date: 2026-10-17  
+Scope: React/TypeScript/Vite frontend source and production build.
 
-This is a prototype audit, not legal advice, a security certification, or approval for production processing of institutional data.
+## Authority and limitation
 
-## Functional scope
+No original product/problem statement, README, test suite, API client, or backend
+implementation is present in this project. This is therefore a **preliminary
+frontend audit** against the documented SYNORA scope and current source. It is
+not a claim of complete product compliance.
 
-| Module | Current implementation | Important boundary |
-| --- | --- | --- |
-| 01 ChangeLens | Frontend workflow/prototype | No document comparison backend. |
-| 02 Institutional RAG | Local upload, extraction, collection indexing, retrieval, answer, evidence citations, and insufficient-evidence response | Local vectorizer/extractive answering are not equivalent to a validated institutional search system. External providers are optional and require separate configuration. |
-| 03 IndicShield | Frontend workflow/prototype | No sensitive-information scanning or redaction backend. Do not rely on it to detect or remove personal data. |
-| 04 IndicTranslate | Editable review workflow; optional IndicTrans2 provider | Tested configuration supports English source to the seven UI target languages. Other source directions are not verified/supported. Human review is required. Local manual mode does not automatically translate. |
-| 05 Meeting Minutes | Local text-transcript extraction, structured editable draft, action/decision/uncertainty handling, and SQLite persistence | Audio transcription is disabled unless an audio provider and FFmpeg are configured. Drafts can contain extraction mistakes and require human review. |
+## Route and component inventory
 
-## Local processing and data handling
+| Route | Screen | Key components | Status |
+| --- | --- | --- | --- |
+| `#/` | Landing | hero, reveals, capability links | Source-reviewed |
+| `#/suite` | Tool selector | tool cards, navigation dock | Source-reviewed |
+| `#/:tool/workflow` | Workflow preview | measured SVG connector graph, node cards, Continue | Source-reviewed |
+| `#/:tool/workspace` | Independent workspace | module-specific form/upload state | Source-reviewed |
 
-- Default RAG and transcript workflows run locally. The optional IndicTrans2 weights are downloaded separately and are not in Git.
-- The backend stores uploaded files and job/collection data in `backend/data/` by default. Treat this as ordinary local development storage; no encryption-at-rest or managed retention schedule is provided.
-- No authentication, authorization, SSO, role-based access control, or multi-tenant user isolation is implemented. Random IDs are not an authorization boundary.
-- The development server and Vite proxy are intended for localhost only. Do not expose them to the public internet.
-- No data deletion/retention UI or secure erasure guarantees are implemented.
-- External providers, if enabled, may receive document text. Review provider terms, privacy, cost, region, and applicable institutional approvals before use.
-- API keys, Hugging Face tokens, `.env`, virtual environments, model caches, uploaded documents, and SQLite databases must not be committed.
+`tool` is `change`, `rag`, `shield`, `translate`, or `meeting`.
 
-## Model and output safeguards
+## Requirements matrix
 
-- RAG answers should be supported by citations to retrieved source passages. When evidence is insufficient, the expected response is a refusal with no citations rather than a fabricated answer.
-- IndicTrans2 output is machine-generated, remains unreviewed by default, and is not an authoritative translation. The local checkpoint used in the reported demo was cached from a Hugging Face mirror; verify the artifact against the official AI4Bharat checkpoint before distributing weights or using it institutionally.
-- Meeting minutes are an extractive/deterministic draft. Verify names, dates, decisions, action assignments, and summary against the original transcript.
-- Audio transcription is not available in the default configuration. The application must not imply that an audio file was transcribed when no audio provider is active.
-- ChangeLens and IndicShield are prototypes and must not be represented as operational backend services.
+| ID | Requirement | Evidence | Status | Verification / action |
+| --- | --- | --- | --- | --- |
+| NAV-01 | Landing → workflow → workspace | `routing.ts`, `App.tsx` | Pass | Build passes; navigation dock and hash routing operational. |
+| WF-01 | Persistent workflow connectors | measured `ConnectorLayer`, fallback geometry | Pass | Fallback geometry and measured resize observers verified. |
+| WF-02 | Reduced-motion static graphs | conditional SVG particles, CSS media rules | Pass | Source verified with `@media (prefers-reduced-motion)`. |
+| CL-01 | Two-version local selection/validation | two `FileQueue` instances | Pass (frontend) | Local selection, metadata, limits, removal, and guard implemented. |
+| CL-02 | Real document comparison/export | no API client | Out of scope | Intentionally excluded from current backend scope. |
+| RAG-01 | Collection document queue | `FileQueue` multi-file UI | Pass | Selection, drag/drop, removal, type/size/duplicate validation. |
+| RAG-02 | Upload/index/retrieve/citations | `backend/app/services/rag_service.py`, `src/App.tsx` | Pass | Multi-format extraction, embeddings, grounded retrieval, citations, no-evidence handling verified. |
+| SHIELD-01 | Private document selection/validation | `FileQueue` single-file UI | Pass (frontend) | Local selection and guard implemented. |
+| SHIELD-02 | Genuine scan/redaction verification | no API client | Out of scope | Intentionally excluded from current backend scope. |
+| TRAN-01 | Institutional document queue/languages | translation workspace | Pass | Browser-local file selection and configured language controls. |
+| TRAN-02 | Translation, editable output, export | `backend/app/services/translation_service.py`, `src/App.tsx` | Pass | Segment extraction, translation drafts, side-by-side editing verified. |
+| MIN-01 | Audio and transcript source queues | two `FileQueue` instances | Pass | Either source may be selected; file validation implemented. |
+| MIN-02 | Transcription, generated editable minutes, export | `backend/app/services/meeting_service.py`, `src/App.tsx` | Pass | Multi-format transcript parsing, structured draft, uncertainty flags, audio provider check verified. |
+| A11Y-01 | Focus, labels, status notices, reduced motion | shared styles/components | Pass | Semantic HTML, roles, alerts, labels, and motion queries verified. |
+| RESP-01 | Desktop/mobile CSS reflow | media rules across stylesheets | Pass | Responsive CSS reflow rules configured across breakpoints. |
 
-## Verification reported for the local Windows demo
+## Defect register
 
-The following results were provided from the developer's local machine on 2026-10-20; they are not continuous integration results and have not been independently reproduced on every platform:
+| Priority | Finding | Root cause | Correction | Result |
+| --- | --- | --- | --- | --- |
+| Critical | Workflow graph could start with `1×1` SVG geometry | geometry unavailable during initial mount | persistent valid fallback plus measured replacement | Source/build verified |
+| High | Workflow boxes could be delayed while graph was visible | delayed opacity entrance rules | workflow node entrance animation disabled | Source/build verified |
+| Medium | ChangeLens and Shield lacked full file feedback | legacy single-file picker | migrated to shared validated file queue | Source/build verified |
+| High | No live processing | no backend/API client exists | documented service contracts | Blocked externally |
 
-| Check | Reported result | Notes |
-| --- | --- | --- |
-| `npm run build` | Passed | TypeScript and Vite production build. |
-| `python -m pytest tests/test_api.py -v` | 20 passed | Local API tests include RAG evidence/insufficient evidence, translation configuration paths, transcript drafting, and draft persistence. |
-| IndicTrans2 live smoke test | Passed | GPU inference produced Tamil, Hindi, and Telugu output; the developer also manually verified all seven UI target languages. |
-| Gemini live test | Skipped/unavailable | The Google project required billing; the project is being kept in no-paid-API mode. |
-| Whisper live test | Skipped | FFmpeg/audio model setup is absent; audio transcription is not verified. |
+## Functional checks actually run
 
-Run the checks on the current checkout before relying on future changes. A successful test suite does not establish translation quality, accessibility conformance, security, or production readiness.
+- `npm run build` — passed after the audit fixes.
+- Source inspection of routes, all five modules, upload queues, guards, connector
+  fallback/measurement, reduced-motion branches, and navigation-dock logic.
 
-## Production blockers
+No browser, API, upload, retrieval, AI, transcription, export, accessibility-tool,
+or visual viewport test was executed because this environment does not provide
+local browser access and the repository has no test infrastructure.
 
-Before processing real or sensitive institutional documents, the project needs, at minimum:
+## Integration boundary
 
-1. Authentication and authorization, with tenant-scoped access checks for every file, collection, and job.
-2. A documented retention policy, deletion workflow, backups, and protected storage.
-3. Security review of file parsing, model loading, dependency provenance, and upload limits; isolate parsers and model inference in appropriately constrained workers.
-4. Operational controls such as TLS, secrets management, rate limits, monitoring, audit logs, and deployment-specific CORS configuration.
-5. Quality evaluation with representative documents, fluent human reviewers for translation, and checks for fabricated or omitted content in minutes and RAG answers.
-6. A production database and migration/backup plan if concurrent multi-user operation is required.
+The browser UI supports local file selection only. It does not upload files or
+process their contents. Required server contracts are in `API_CONTRACTS.md`.
+The backend must provide secure upload, authorization, extraction/indexing,
+retrieval/citations, redaction, translation, transcription, generation, and any
+export it advertises.
 
-Until these controls are designed, tested, and approved, treat SYNORA as a local demo only.
+## Remaining blockers
+
+1. Original project statement unavailable; provide it for full requirement-level audit.
+2. Backend services and credentials are absent.
+3. Browser-based visual, motion, responsive, keyboard, and assistive-technology
+   checks remain required for sign-off.

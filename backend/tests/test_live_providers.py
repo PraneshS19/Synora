@@ -2,8 +2,6 @@ import os
 import shutil
 import pytest
 from app.config import settings
-from app.providers.embeddings import GeminiEmbeddingProvider
-from app.providers.llm import GeminiLLMProvider
 from app.providers.translation import IndicTrans2Provider
 from app.providers.audio import WhisperAudioProvider
 
@@ -12,33 +10,6 @@ from app.providers.audio import WhisperAudioProvider
 # These tests exercise REAL model calls and check external dependencies.
 # They are kept strictly separate from the local fallback test suite (test_api.py).
 # ==============================================================================
-
-def test_live_gemini_smoke_test():
-    """
-    Smoke test for real Gemini Embeddings (gemini-embedding-001) and Generation (gemini-2.5-flash).
-    Only runs if GEMINI_API_KEY is provided in .env or environment.
-    """
-    api_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
-    if not api_key or api_key == "your_gemini_api_key_here":
-        pytest.skip(
-            "GEMINI_API_KEY is not configured in .env or environment. "
-            "Skipping live Gemini model smoke test. "
-            "To exercise live Gemini calls, add a valid GEMINI_API_KEY to backend/.env."
-        )
-
-    # 1. Real Gemini Embeddings with gemini-embedding-001
-    embed_provider = GeminiEmbeddingProvider(api_key=api_key, model=settings.GEMINI_EMBEDDING_MODEL)
-    query_vector = embed_provider.embed_query("Institutional admissions policy")
-    assert isinstance(query_vector, list)
-    assert len(query_vector) > 0, "Real Gemini embedding call returned an empty vector."
-
-    # 2. Real Gemini LLM generation with gemini-2.5-flash
-    llm_provider = GeminiLLMProvider(api_key=api_key, model_name=settings.GEMINI_MODEL)
-    response_text = llm_provider.generate(
-        prompt="Respond with the single word 'VERIFIED' if you receive this prompt.",
-        system_instruction="You are a strict smoke-testing probe."
-    )
-    assert "VERIFIED" in response_text.upper(), f"Unexpected live model response: {response_text}"
 
 def test_live_indictrans2_smoke_test():
     """

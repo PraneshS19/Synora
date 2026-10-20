@@ -48,22 +48,6 @@ class LocalExtractiveLLMProvider(LLMProvider):
         top_sentences = [s for _, s in scored[:3]]
         return " ".join(top_sentences)
 
-class GeminiLLMProvider(LLMProvider):
-    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash"):
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is not set.")
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(
-            model_name=model_name,
-            generation_config={"temperature": 0.1}
-        )
-
-    def generate(self, prompt: str, system_instruction: str = "") -> str:
-        full_prompt = f"{system_instruction}\n\n{prompt}" if system_instruction else prompt
-        response = self.model.generate_content(full_prompt)
-        return response.text.strip() if response.text else ""
-
 class OpenAILLMProvider(LLMProvider):
     def __init__(self, api_key: str, base_url: str = "https://api.openai.com/v1", model_name: str = "gpt-4o-mini"):
         if not api_key:
@@ -91,12 +75,6 @@ def get_llm_provider() -> LLMProvider:
     provider_name = settings.LLM_PROVIDER.lower()
     if provider_name == "local":
         return LocalExtractiveLLMProvider()
-    elif provider_name == "gemini":
-        if not settings.GEMINI_API_KEY:
-            raise RuntimeError(
-                "Gemini LLM provider requested, but GEMINI_API_KEY is not configured in .env."
-            )
-        return GeminiLLMProvider(settings.GEMINI_API_KEY, settings.GEMINI_MODEL)
     elif provider_name == "openai":
         if not settings.OPENAI_API_KEY:
             raise RuntimeError(
@@ -104,4 +82,4 @@ def get_llm_provider() -> LLMProvider:
             )
         return OpenAILLMProvider(settings.OPENAI_API_KEY, settings.OPENAI_BASE_URL, settings.OPENAI_MODEL)
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: '{provider_name}'. Supported: 'local', 'gemini', 'openai'.")
+        raise ValueError(f"Unknown LLM_PROVIDER: '{provider_name}'. Supported: 'local', 'openai'.")

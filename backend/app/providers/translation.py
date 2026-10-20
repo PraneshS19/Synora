@@ -133,7 +133,7 @@ class TranslationProvider(ABC):
 
 class LocalTranslationProvider(TranslationProvider):
     """
-    Local translation provider when no neural MT model (IndicTrans2 or Gemini) is active.
+    Local translation provider when no neural MT model (IndicTrans2) is active.
     Returns blank drafts for segments so the user can manually enter translations.
     Never produces glossary substitutions, unchanged English, or mixed-language text.
     """
@@ -142,62 +142,19 @@ class LocalTranslationProvider(TranslationProvider):
         # without presenting glossary substitutions as machine translations.
         return ["" for _ in segments]
 
-class GeminiTranslationProvider(TranslationProvider):
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is not set.")
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
-
-    def translate_segments(self, segments: list[str], source_lang: str, target_lang: str) -> list[str]:
-        if not segments:
-            return []
-
-        prompt = (
-            f"You are an institutional document translation engine.\n"
-            f"Translate each numbered segment from {source_lang} to {target_lang}.\n"
-            f"Keep formal institutional terminology intact. Do not add conversational remarks.\n"
-            f"Output each translated segment on a separate line prefixed with 'SEGMENT_N: '.\n\n"
-        )
-        for idx, seg in enumerate(segments, start=1):
-            prompt += f"SEGMENT_{idx}: {seg}\n"
-
-        response = self.model.generate_content(prompt)
-        text = response.text or ""
-
-        results: list[str] = []
-        seg_pattern = re.compile(r"SEGMENT_\d+:\s*(.*)")
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-        for line in lines:
-            m = seg_pattern.match(line)
-            if m:
-                results.append(m.group(1).strip())
-
-        if len(results) != len(segments):
-            raise RuntimeError(
-                f"Gemini translation returned {len(results)} segments, expected {len(segments)}. "
-                f"Source text is preserved. Please try again or switch to manual editing."
-            )
-
-        return results
-
 class IndicTrans2Provider(TranslationProvider):
     """
     AI4Bharat IndicTrans2 Neural Machine Translation integration.
-    Default checkpoint: ai4bharat/indictrans2-en-indic-dist-200M (~1.1 GB local cache).
-    The model checkpoint is MIT-licensed by AI4Bharat. Verify any mirrored weights
-    against the official upstream checkpoint before redistribution or deployment.
-    This configured checkpoint supports English-to-Indic translation.
+    Model checkpoint: ai4bharat/indictrans2-en-indic-1B (~4 GB download).
+    License: MIT / CC-BY 4.0.
 
     Dependencies (pip):
         transformers, torch, sentencepiece, accelerate
         IndicTransToolkit  (pip install git+https://github.com/VarunGumma/IndicTransToolkit.git)
 
-    The constructor does NOT auto-download weights.
+    The constructor does NOT auto-download multi-GB weights.
     Pre-download with:
-        hf download ai4bharat/indictrans2-en-indic-dist-200M
+        huggingface-cli download ai4bharat/indictrans2-en-indic-1B
     """
 
     # ── BCP-47 language-code map used by IndicTrans2 ──────────────────
@@ -284,7 +241,7 @@ class IndicTrans2Provider(TranslationProvider):
                 f"IndicTrans2 model weights for '{self.model_name}' are not present in "
                 f"the local HuggingFace cache (~1.1 GB). Download them first:\n"
                 f"  hf download {self.model_name}\n"
-                f"Or choose a different provider: TRANSLATION_PROVIDER=gemini|local\n"
+                f"Or choose a different provider: TRANSLATION_PROVIDER=local\n"
                 f"(Underlying error: {last_err})"
             )
 
@@ -386,13 +343,8 @@ def get_translation_provider() -> TranslationProvider:
         return NullTranslationProvider()
     elif provider_name == "local":
         return LocalTranslationProvider()
-    elif provider_name == "gemini":
-        if not settings.GEMINI_API_KEY:
-            raise RuntimeError(
-                "Gemini translation provider requested, but GEMINI_API_KEY is not configured in .env."
-            )
-        return GeminiTranslationProvider(settings.GEMINI_API_KEY)
     elif provider_name == "indictrans2":
         return IndicTrans2Provider()
     else:
-        raise ValueError(f"Unknown TRANSLATION_PROVIDER: '{provider_name}'. Supported: 'local', 'gemini', 'indictrans2', 'none'.")
+        raise ValueError(f"Unknown TRANSLATION_PROVIDER: '{provider_name}'. Supported: 'local', 'indictrans2', 'none'.")
+
