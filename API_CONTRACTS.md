@@ -1,52 +1,132 @@
-# SYNORA integration contracts
+# SYNORA API contracts
 
-The frontend keeps selected files in browser memory only. No upload, extraction,
-indexing, translation, transcription, generation, or export occurs without a
-server-side implementation of these contracts.
+This document summarizes the FastAPI routes implemented for modules 02, 04, and 05. The source of truth is `backend/app/main.py` and `backend/app/models/schemas.py`; keep this document and the TypeScript API client in `src/api.ts` aligned when contracts change.
 
-## Shared upload
+Local API base URL: `http://127.0.0.1:8000`. The Vite development server proxies `/api/*` to this address.
 
-`POST /api/uploads`
+## Health
 
-- Request: `multipart/form-data`, with one or more `files` and a `module` value.
-- Response: `{ files: [{ id, name, mimeType, size, status }] }`.
-- The server must validate file type and size, scan content, enforce access control,
-  and return no provider credentials to the browser.
+`GET /api/health`
 
-## Institutional RAG
+Returns service status, supported backend modules, and configured provider names. This is a liveness/configuration response, not a readiness guarantee that optional models or external services are reachable.
+
+## Upload files
+
+`POST /api/uploads` (`multipart/form-data`)
+
+Fields:
+
+- `files`: one or more selected files.
+- `module`: module identifier such as `rag`, `translate`, or `meeting`.
+
+The backend applies module-specific extension, size, and file-content checks. Successful responses contain file metadata and generated internal IDs. Files are stored under `backend/data/` by default and are not served from the frontend. Do not upload sensitive production data to this local prototype.
+
+## Module 02 — Institutional RAG
+
+### Create/index a collection
 
 `POST /api/rag/collections`
 
-- Request: `{ name, fileIds }`.
-- Response: `{ id, status: "uploading" | "extracting" | "indexing" | "ready" | "failed" }`.
+```json
+{
+  "name": "Library Policy",
+  "fileIds": ["<uploaded-file-id>"]
+}
+```
 
-`POST /api/rag/collections/:id/questions`
+The service extracts passages, builds an index with the configured embedding provider, and returns collection status and embedding metadata.
 
-- Request: `{ question }`.
-- Response: `{ answer, citations: [{ fileId, name, page?, section?, excerpt }] }`.
-- If retrieval finds insufficient evidence, return an explicit no-evidence status;
-  do not generate unsupported answers.
+### Read a collection
 
-## IndicTranslate
+`GET /api/rag/collections/{collection_id}`
+
+### Ask a question
+
+`POST /api/rag/collections/{collection_id}/questions`
+
+```json
+{ "question": "How many books may a student borrow?" }
+```
+
+The response includes `answer`, `citations`, `evidenceFound`, and `providerUsed`. Citations include source file metadata and an excerpt, with page/section information when available. When the collection has insufficient evidence, the expected response has `evidenceFound: false` and an empty citations list. A collection indexed with an incompatible embedding provider/dimension must be re-indexed rather than queried against incompatible vectors.
+
+## Module 04 — IndicTranslate
+
+### Create a translation job
 
 `POST /api/translate/jobs`
 
-- Request: `{ fileIds, sourceLanguage, targetLanguage }`.
-- Response: `{ id, status }`.
+```json
+{
+  "sourceText": "The meeting will begin tomorrow.",
+  "sourceLanguage": "English",
+  "targetLanguage": "Tamil"
+}
+```
 
-`GET /api/translate/jobs/:id`
+The request may instead include uploaded `fileIds`. The response contains a job ID, status, source/target language, segments, provider name, limitations, and any error.
 
-- Response: source segments, translated editable segments, review flags, and any
-  extraction limitations. Export endpoints must only advertise formats they create.
+- With `TRANSLATION_PROVIDER=local` or `none`, translations are intentionally blank and marked as not machine-translated; users may enter drafts manually.
+- With `TRANSLATION_PROVIDER=indictrans2`, local model weights and dependencies must already be installed. The tested checkpoint supports English-to-Indic translation for the seven target languages in the UI. Other source directions are not supported by that tested configuration.
+- Generated machine translations require human review; they are not automatically approved.
 
-## Meeting Minutes
+### Read a job
+
+`GET /api/translate/jobs/{job_id}`
+
+### Save a segment review/edit
+
+`PUT /api/translate/jobs/{job_id}/segments/{segment_id}`
+
+```json
+{
+  "translated": "<reviewed translation>",
+  "reviewFlag": "edited"
+}
+```
+
+Allowed review states are defined in the schemas and frontend client. The service persists segment changes in the local database.
+
+## Module 05 — Meeting Minutes
+
+### Create a minutes job
 
 `POST /api/meetings/jobs`
 
-- Request: `{ audioFileIds?, transcriptFileIds? }`.
-- Response: `{ id, status }`.
+```json
+{
+  "transcriptFileIds": ["<uploaded-transcript-id>"],
+  "audioFileIds": [],
+  "meetingTitle": "Library Renovation Meeting"
+}
+```
 
-`GET /api/meetings/jobs/:id`
+The response contains job status and, when successful, an editable draft with title, summary, discussion topics, decisions, action items, uncertainties, and human-review limitations. Items should be grounded in transcript content; owner/date information is not invented. Text transcript formats depend on the extractor and upload validation. Audio processing is unavailable unless an audio provider is installed and configured.
 
-- Response: an editable review draft with only source-supported summary,
-  discussions, decisions, action items, timestamps, and uncertainty flags.
+### Read a job
+
+- `GET /api/meetings/jobs/{job_id}` — retrieve a specific job and its saved draft.
+- `GET /api/meetings/jobs/latest` — retrieve the most recent job for restoring the workspace.
+
+### Save draft edits
+
+`PUT /api/meetings/jobs/{job_id}/draft`
+
+```json
+{
+  "draft": {
+    "title": "Library Renovation Meeting",
+    "summary": "<edited summary>",
+    "discussions": [],
+    "decisions": [],
+    "actionItems": [],
+    "uncertainties": []
+  }
+}
+```
+
+The service validates and persists the draft in SQLite. Refresh restoration depends on the job ID stored by the frontend and the latest-job endpoint.
+
+## Scope and errors
+
+Modules 01 ChangeLens and 03 IndicShield do not have processing endpoints in this backend. API errors use HTTP status codes and a `detail` or job `error` message; do not expose credentials, raw secrets, or private source text in logs or public error pages.
